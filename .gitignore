@@ -1,0 +1,8 @@
+.build/
+dist/
+.DS_Store
+# Local design drafts and raw process measurements
+design/
+validation/
+Assets/Slidebox.iconset/
+README.draft.md
