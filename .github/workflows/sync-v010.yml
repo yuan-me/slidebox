@@ -1,0 +1,24 @@
+name: Sync v0.1.0 source tag
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/sync-v010.yml]
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Point v0.1.0 at the published source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current=$(gh api repos/yuan-me/slidebox/git/ref/tags/v0.1.0 --jq .object.sha)
+          case "$current" in
+            ac76e261d36d2f735ef3d792632f611a190b2770) exit 0 ;;
+            c141bcea1583df29542a680b733062b0aad5d4e0) ;;
+            *) echo "Unexpected tag target; refusing to overwrite"; exit 1 ;;
+          esac
+          gh api --method PATCH repos/yuan-me/slidebox/git/refs/tags/v0.1.0 -f sha=ac76e261d36d2f735ef3d792632f611a190b2770 -F force=true
+
