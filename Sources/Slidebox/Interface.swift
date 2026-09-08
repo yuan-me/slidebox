@@ -106,16 +106,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        if CommandLine.arguments.contains("--web-self-test") || CommandLine.arguments.contains("--memory-self-test") {
+        if CommandLine.arguments.contains("--web-self-test") || CommandLine.arguments.contains("--memory-self-test") || CommandLine.arguments.contains("--browser-self-test") {
             Task { @MainActor in
                 do {
-                    if CommandLine.arguments.contains("--memory-self-test") { try await runMemoryChecks() }
+                    if CommandLine.arguments.contains("--browser-self-test") { try await runBrowserChecks() }
+                    else if CommandLine.arguments.contains("--memory-self-test") { try await runMemoryChecks() }
                     else { try await runWebChecks(); print("PASS: real WebKit lifecycle checks") }
                     exit(0)
                 }
                 catch { fputs("WebKit check failed: \(error)\n", stderr); exit(1) }
             }
             return
+        }
+        SiteIcons.shared.changed = { [weak self] in
+            self?.renderRail()
+            self?.updatePreview()
         }
         makeWindow()
         pages.configureSleep(enabled: store.preferences.sleepEnabled, seconds: store.preferences.sleepSeconds)
@@ -465,12 +470,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
     private func siteIcon(_ url: URL) -> NSImage? {
-        // ponytail: bundle the two focus-site icons; other sites use a globe until generic favicon support is needed.
         let name = url.host == "chat.deepseek.com" ? "deepseek" : (url.host == "chatgpt.com" ? "chatgpt" : "")
-        if !name.isEmpty, let image = NSImage(named: NSImage.Name(name)) {
-            image.size = NSSize(width: 18, height: 18); return image
-        }
-        return NSImage(systemSymbolName: "globe", accessibilityDescription: "网站")
+        guard let image = (SiteIcons.shared.image(for: url)
+            ?? (name.isEmpty ? nil : NSImage(named: NSImage.Name(name)))
+            ?? NSImage(systemSymbolName: "globe", accessibilityDescription: "网站"))?.copy() as? NSImage else { return nil }
+        let side = max(image.size.width, image.size.height)
+        guard side > 0 else { return nil }
+        image.size = NSSize(width: image.size.width * 18 / side, height: image.size.height * 18 / side)
+        return image
     }
 
     private func showSettings() {
@@ -579,6 +586,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         NSLayoutConstraint.activate([view.centerXAnchor.constraint(equalTo: content.centerXAnchor), view.centerYAnchor.constraint(equalTo: content.centerYAnchor), view.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, constant: -48)])
     }
     private func runLayoutChecks() -> Bool {
+        for address in ["https://chat.deepseek.com", "https://chatgpt.com", "https://mail.google.com"] {
+            guard let image = siteIcon(URL(string: address)!),
+                  abs(max(image.size.width, image.size.height) - 18) < 0.01 else {
+                print("FAIL: inconsistent site icon size"); return false
+            }
+        }
+        print("PASS: website icons fit an 18pt box")
         for size in [NSSize(width: 360, height: 300), NSSize(width: 480, height: 680), NSSize(width: 720, height: 500)] {
             panel.setContentSize(size)
             for settings in [false, true] {

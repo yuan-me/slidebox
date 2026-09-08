@@ -87,3 +87,41 @@ func runMemoryChecks() async throws {
     }
     print("PASS: public-site memory lifecycle checks"); fflush(stdout)
 }
+
+@MainActor
+func runBrowserChecks() async throws {
+    precondition(SiteIcons.key(URL(string: "https://example.com/a?q=1#x")!) == "https://example.com")
+    precondition(SiteIcons.key(URL(string: "https://example.com:8443/b")!) == "https://example.com:8443")
+    precondition(SiteIcons.key(URL(string: "file:///tmp/icon")!) == nil)
+    guard let fixture = ProcessInfo.processInfo.environment["SLIDEBOX_ICON_FIXTURE"], let url = URL(string: fixture) else {
+        throw NSError(domain: "Set SLIDEBOX_ICON_FIXTURE to the local icon fixture URL", code: 1)
+    }
+    let page = WebPage(site: Site(name: "Icon check", url: url))
+    defer { page.dispose() }
+    for _ in 0..<150 {
+        if SiteIcons.shared.image(for: url) != nil { break }
+        try await Task.sleep(for: .milliseconds(100))
+    }
+    precondition(SiteIcons.shared.image(for: url) != nil, "Declared favicon not downloaded")
+    let ua = try await page.view.evaluateJavaScript("navigator.userAgent") as? String ?? ""
+    precondition(ua.contains("Version/") && ua.contains("Safari/"), "Missing Safari browser identification")
+    print("PASS: favicon discovery, download, origin keys; UA=\(ua)")
+    for address in ["https://mail.google.com/", "https://chat.deepseek.com/", "https://chatgpt.com/"] {
+        let site = WebPage(site: Site(name: "Compatibility check", url: URL(string: address)!))
+        for _ in 0..<450 {
+            try await Task.sleep(for: .milliseconds(100))
+            if !site.view.isLoading { break }
+        }
+        try await Task.sleep(for: .seconds(3))
+        guard !site.view.isLoading else {
+            site.dispose()
+            throw NSError(domain: "Page load timed out; compatibility inconclusive: " + address, code: 1)
+        }
+        let hasContent = try await site.view.evaluateJavaScript("document.body.innerText.trim().length > 0") as? Bool ?? false
+        guard hasContent else { site.dispose(); throw NSError(domain: "Empty page: " + address, code: 1) }
+        let unsupported = try await site.view.evaluateJavaScript("document.body.innerText.includes('This browser version is no longer supported')") as? Bool ?? false
+        print("BROWSER \(address) host=\(site.view.url?.host ?? "") loading=\(site.view.isLoading) unsupported=\(unsupported)")
+        site.dispose()
+        if unsupported { throw NSError(domain: "Unsupported browser: " + address, code: 1) }
+    }
+}

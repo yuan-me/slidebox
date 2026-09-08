@@ -13,6 +13,10 @@ final class WebPage: NSObject, WKNavigationDelegate, WKUIDelegate {
     init(site: Site) {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
+        // Match the installed Safari version without claiming a different browser engine.
+        if let version = Bundle(path: "/Applications/Safari.app")?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+            configuration.applicationNameForUserAgent = "Version/\(version) Safari/605.1.15"
+        }
         configuration.preferences.inactiveSchedulingPolicy = .suspend
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         view = WKWebView(frame: .zero, configuration: configuration)
@@ -57,7 +61,10 @@ final class WebPage: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { loadingChanged?(true) }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loadingChanged?(false) }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        loadingChanged?(false)
+        SiteIcons.shared.discover(in: webView)
+    }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { report(error) }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { report(error) }
     private func report(_ error: Error) {

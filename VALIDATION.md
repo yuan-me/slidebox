@@ -25,3 +25,11 @@ RSS totals can double-count shared pages and are not physical-memory savings. Re
 - 实际鼠标拖放、多显示器、登录启动、Spaces、登录态流式聊天尚未完整验证。
 
 复现网页内存采样：构建应用后，使用 Python 3 运行 `scripts/check-memory.py`（约 5 分钟，将访问上述两个公开网址）。
+
+## 浏览器标识与网站图标（2026-09-08）
+
+网页标识补充本机 Safari 版本。Gmail、DeepSeek、ChatGPT 入口加载完成后，均未检测到 “This browser version is no longer supported” 提示；未验证登录后的邮箱操作或聊天。
+
+本地 HTTP 页面中声明的自定义图标已自动下载、缩略并缓存；来源键隔离及 Safari 标识检查通过。图标请求不使用额外网页实例，单图限制 512 KiB，缩略至 64px，缓存 7 天。
+
+复现：构建后运行 `python3 scripts/check-browser.py`。此检查会访问上述三个网站。
