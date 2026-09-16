@@ -2,6 +2,132 @@ import AppKit
 import WebKit
 
 @MainActor
+func runDataChecks() async throws {
+    guard let fixture = ProcessInfo.processInfo.environment["SLIDEBOX_ICON_FIXTURE"], let url = URL(string: fixture) else {
+        throw NSError(domain: "Set SLIDEBOX_ICON_FIXTURE to the local data fixture URL", code: 1)
+    }
+    let suite = "Slidebox-check-" + UUID().uuidString
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let store = Store(defaults: defaults)
+    let site = Site(name: "Saved home", url: url)
+    store.sites = [site]
+    // A unique persistent store exercises the same HTTP cache as the app, without user data.
+    let pages = WebPages(dataStore: WKWebsiteDataStore(forIdentifier: UUID()))
+    defer { pages.dispose() }
+    func loaded(_ page: WebPage, at expected: URL) async throws {
+        for _ in 0..<100 {
+            if page.view.url == expected && !page.view.isLoading,
+               (try? await page.view.evaluateJavaScript("document.readyState")) as? String == "complete" { return }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        throw NSError(domain: "Local fixture failed to load: " + expected.absoluteString, code: 1)
+    }
+    let page = pages.activate(site)
+    try await loaded(page, at: url)
+    let conversation = url.appendingPathComponent("c/example")
+    _ = try await page.view.evaluateJavaScript("history.pushState({}, '', '/c/example')")
+    try await Task.sleep(for: .milliseconds(100))
+    precondition(page.view.url == conversation)
+    pages.suspendActive()
+    precondition(pages.activate(site) === page, "Quick resume must keep the current page")
+    pages.suspendActive()
+    pages.expire(at: .now.advanced(by: .seconds(31)))
+    let restored = pages.activate(site)
+    try await loaded(restored, at: conversation)
+    precondition(store.sites == [site] && Store(defaults: defaults).sites == [site], "Navigation overwrote the bookmark")
+    print("PASS: SPA navigation and sleep recovery leave saved URLs unchanged")
+
+    // With sleep disabled a hidden SPA may still navigate; capture its URL at disposal.
+    pages.configureSleep(enabled: false, seconds: 30)
+    pages.suspendActive()
+    let backgroundURL = url.appendingPathComponent("c/background")
+    _ = try await restored.view.evaluateJavaScript("history.pushState({}, '', '/c/background')")
+    pages.configureSleep(enabled: true, seconds: 30)
+    pages.expire(at: .now.advanced(by: .seconds(31)))
+    let background = pages.activate(site)
+    try await loaded(background, at: backgroundURL)
+    precondition(Store(defaults: defaults).sites == [site])
+    print("PASS: hidden SPA navigation survives sleep without a URL observer")
+
+    _ = try await background.view.callAsyncJavaScript("""
+        document.cookie = 'slidebox_login=keep; path=/; SameSite=Lax';
+        localStorage.setItem('slidebox_login', 'keep');
+        await new Promise((resolve, reject) => {
+            const request = indexedDB.open('slidebox-check', 1);
+            request.onupgradeneeded = () => request.result.createObjectStore('session');
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+                const db = request.result, tx = db.transaction('session', 'readwrite');
+                tx.objectStore('session').put('keep', 'login');
+                tx.oncomplete = () => { db.close(); resolve(); };
+                tx.onerror = () => reject(tx.error);
+            };
+        });
+        return true;
+        """, arguments: [:], in: nil, contentWorld: .page)
+    let fetch = "return await (await fetch('/cached.txt')).text();"
+    let first = try await background.view.callAsyncJavaScript(fetch, arguments: [:], in: nil, contentWorld: .page) as? String
+    let cached = try await background.view.callAsyncJavaScript(fetch, arguments: [:], in: nil, contentWorld: .page) as? String
+    guard first == "1" && cached == first else {
+        throw NSError(domain: "Fixture response was not cached: first=\(first ?? "nil"), second=\(cached ?? "nil")", code: 1)
+    }
+    await pages.clearCache()
+    let fresh = try await background.view.callAsyncJavaScript(fetch, arguments: [:], in: nil, contentWorld: .page) as? String
+    precondition(fresh == "2", "Resource cache was not cleared")
+    pages.remove(site.id)
+    let reopened = pages.activate(site)
+    try await loaded(reopened, at: url)
+    let kept = try await reopened.view.callAsyncJavaScript("""
+        const value = await new Promise((resolve, reject) => {
+            const request = indexedDB.open('slidebox-check', 1);
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+                const db = request.result;
+                const read = db.transaction('session').objectStore('session').get('login');
+                read.onsuccess = () => { db.close(); resolve(read.result); };
+                read.onerror = () => reject(read.error);
+            };
+        });
+        return document.cookie.includes('slidebox_login=keep') && localStorage.getItem('slidebox_login') === 'keep' && value === 'keep';
+        """, arguments: [:], in: nil, contentWorld: .page) as? Bool
+    precondition(kept == true, "Cache clearing removed login storage")
+    print("PASS: HTTP cache cleared; cookies, localStorage and IndexedDB survive page recreation")
+
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let icons = SiteIcons(directory: directory)
+    icons.discover(in: reopened.view)
+    for _ in 0..<100 {
+        if icons.image(for: url) != nil { break }
+        try await Task.sleep(for: .milliseconds(100))
+    }
+    precondition(icons.image(for: url) != nil, "Fixture icon was not cached")
+    try icons.clearCache()
+    precondition(icons.image(for: url) == nil && !FileManager.default.fileExists(atPath: directory.path))
+    try icons.clearCache() // Clearing an already-empty cache is safe.
+    icons.discover(in: reopened.view)
+    try icons.clearCache()
+    try await Task.sleep(for: .milliseconds(200))
+    precondition(icons.image(for: url) == nil, "An old download repopulated the cleared icon cache")
+    precondition(Store(defaults: defaults).sites == [site])
+    print("PASS: icon memory/disk cache cleared; repeated clearing is safe")
+
+    _ = try await reopened.view.evaluateJavaScript("history.pushState({}, '', '/c/another')")
+    try await Task.sleep(for: .milliseconds(100))
+    pages.dispose()
+    try await loaded(pages.activate(site), at: url)
+    pages.remove(site.id)
+    store.sites[0].url = url.appendingPathComponent("edited")
+    try await loaded(pages.activate(store.sites[0]), at: store.sites[0].url)
+    precondition(Store(defaults: defaults).sites == store.sites)
+    print("PASS: a new session starts at the bookmark; explicit URL edits still persist")
+    pages.dispose()
+    // This store contains only fixture data, never real bookmarks or accounts.
+    await pages.dataStore.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+}
+
+@MainActor
 func runWebChecks() async throws {
     // Prevent test-runner App Nap from turning a requested 29s wait into a >30s wait.
     let activity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Slidebox lifecycle verification")

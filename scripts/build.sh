@@ -11,10 +11,11 @@ if [[ "${1:-}" == "--debug" ]]; then
 fi
 binaries=()
 for architecture in "${architectures[@]}"; do
-  swift build --disable-sandbox --cache-path "$PWD/.build/cache" \
+  build_options=(--disable-sandbox --cache-path "$PWD/.build/cache" \
     --config-path "$PWD/.build/config" --security-path "$PWD/.build/security" \
-    --scratch-path "$PWD/.build/$architecture" --arch "$architecture" -c "$configuration"
-  binaries+=("$PWD/.build/$architecture/$architecture-apple-macosx/$configuration/Slidebox")
+    --scratch-path "$PWD/.build/$architecture" --arch "$architecture" -c "$configuration")
+  swift build "${build_options[@]}"
+  binaries+=("$(swift build "${build_options[@]}" --show-bin-path)/Slidebox")
 done
 app="$PWD/dist/Slidebox.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"

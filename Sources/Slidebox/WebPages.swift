@@ -4,15 +4,13 @@ import WebKit
 @MainActor
 final class WebPage: NSObject, WKNavigationDelegate, WKUIDelegate {
     let view: WKWebView
-    var changed: ((URL) -> Void)?
     var failed: ((String) -> Void)?
     var loadingChanged: ((Bool) -> Void)?
-    private var observation: NSKeyValueObservation?
     private var interrupted = false
 
-    init(site: Site) {
+    init(site: Site, dataStore: WKWebsiteDataStore? = nil) {
         let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .default()
+        configuration.websiteDataStore = dataStore ?? .default()
         // Match the installed Safari version without claiming a different browser engine.
         if let version = Bundle(path: "/Applications/Safari.app")?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
             configuration.applicationNameForUserAgent = "Version/\(version) Safari/605.1.15"
@@ -25,19 +23,13 @@ final class WebPage: NSObject, WKNavigationDelegate, WKUIDelegate {
         view.uiDelegate = self
         view.allowsBackForwardNavigationGestures = false
         view.underPageBackgroundColor = .textBackgroundColor
-        observation = view.observe(\.url) { [weak self] _, _ in
-            Task { @MainActor [weak self] in
-                guard let self, let url = self.view.url, websiteURL(url.absoluteString) != nil else { return }
-                self.changed?(url)
-            }
-        }
         view.load(URLRequest(url: site.url))
     }
 
     func suspend(enabled: Bool) {
         view.configuration.preferences.inactiveSchedulingPolicy = enabled ? .suspend : .throttle
         if enabled {
-            interrupted = view.isLoading
+            interrupted = interrupted || view.isLoading
             view.stopLoading()
             view.setAllMediaPlaybackSuspended(true, completionHandler: nil)
         }
@@ -52,10 +44,8 @@ final class WebPage: NSObject, WKNavigationDelegate, WKUIDelegate {
     func dispose() {
         view.stopLoading()
         view.removeFromSuperview()
-        observation = nil
         view.navigationDelegate = nil
         view.uiDelegate = nil
-        changed = nil
         failed = nil
         loadingChanged = nil
     }
@@ -131,11 +121,21 @@ final class WebPage: NSObject, WKNavigationDelegate, WKUIDelegate {
 
 @MainActor
 final class WebPages {
+    let dataStore: WKWebsiteDataStore
     private(set) var pages: [UUID: WebPage] = [:]
     private(set) var active: UUID?
     private var retention = Retention()
     private var expiration: Task<Void, Never>?
     private var scheduledDeadline: ContinuousClock.Instant?
+    // Browsing state belongs to this session, never to the saved bookmark.
+    private var currentURLs: [UUID: URL] = [:]
+
+    init(dataStore: WKWebsiteDataStore? = nil) { self.dataStore = dataStore ?? .default() }
+
+    func clearCache() async {
+        // An allowlist keeps cookies, local storage, IndexedDB and service workers intact.
+        await dataStore.removeData(ofTypes: [WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache], modifiedSince: .distantPast)
+    }
 
     func configureSleep(enabled: Bool, seconds: Int) {
         retention = Retention(delay: enabled ? seconds : nil)
@@ -150,9 +150,11 @@ final class WebPages {
         expire()
         if let active, active != site.id { suspend(active) }
         retention.activate(site.id)
+        var browsingSite = site
+        browsingSite.url = currentURLs[site.id] ?? site.url
         let page: WebPage
-        if let existing = pages[site.id] { page = existing; page.resume(url: site.url) }
-        else { page = WebPage(site: site); pages[site.id] = page }
+        if let existing = pages[site.id] { page = existing; page.resume(url: page.view.url ?? browsingSite.url) }
+        else { page = WebPage(site: browsingSite, dataStore: dataStore); pages[site.id] = page }
         active = site.id
         schedule()
         return page
@@ -171,6 +173,7 @@ final class WebPages {
 
     func remove(_ id: UUID) {
         pages.removeValue(forKey: id)?.dispose()
+        currentURLs.removeValue(forKey: id)
         retention.activate(id)
         if active == id { active = nil }
         schedule()
@@ -178,6 +181,8 @@ final class WebPages {
 
     func expire(at now: ContinuousClock.Instant = .now) {
         for id in retention.expired(at: now) where id != active {
+            // The live web view already tracks navigation, including background SPA updates.
+            if let url = pages[id]?.view.url, websiteURL(url.absoluteString) != nil { currentURLs[id] = url }
             pages.removeValue(forKey: id)?.dispose()
             retention.activate(id)
         }
@@ -204,5 +209,6 @@ final class WebPages {
         scheduledDeadline = nil
         pages.values.forEach { $0.dispose() }
         pages.removeAll(); active = nil; retention = Retention()
+        currentURLs.removeAll()
     }
 }

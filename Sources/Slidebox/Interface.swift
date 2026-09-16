@@ -97,6 +97,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var formError: NSTextField?
     private var loginStatus: NSTextField?
     private var sleepInput: NSTextField?
+    private var clearingCache = false
+    private weak var cacheButton: NSButton?
     private var spinner: NSProgressIndicator?
     private var previewBox: NSBox?
     private var previewTitle: NSTextField?
@@ -106,10 +108,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        if CommandLine.arguments.contains("--web-self-test") || CommandLine.arguments.contains("--memory-self-test") || CommandLine.arguments.contains("--browser-self-test") {
+        if CommandLine.arguments.contains("--web-self-test") || CommandLine.arguments.contains("--memory-self-test") || CommandLine.arguments.contains("--browser-self-test") || CommandLine.arguments.contains("--data-self-test") {
             Task { @MainActor in
                 do {
-                    if CommandLine.arguments.contains("--browser-self-test") { try await runBrowserChecks() }
+                    if CommandLine.arguments.contains("--data-self-test") { try await runDataChecks() }
+                    else if CommandLine.arguments.contains("--browser-self-test") { try await runBrowserChecks() }
                     else if CommandLine.arguments.contains("--memory-self-test") { try await runMemoryChecks() }
                     else { try await runWebChecks(); print("PASS: real WebKit lifecycle checks") }
                     exit(0)
@@ -336,6 +339,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         addressInput = nil; nameInput = nil; formError = nil; loginStatus = nil; spinner = nil
         previewBox = nil; previewTitle = nil; previewDomain = nil; previewIcon = nil
         sleepInput = nil
+        cacheButton = nil
     }
 
     private func select(_ id: UUID) {
@@ -362,10 +366,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             center(stack); return
         }
         let page = pages.activate(site)
-        page.changed = { [weak self] url in
-            guard let self, let index = self.store.sites.firstIndex(where: { $0.id == site.id }) else { return }
-            self.store.sites[index].url = url
-        }
         page.failed = { [weak self] message in
             guard let self, self.visible, self.currentPage == .website, self.store.selected == site.id else { return }
             self.showWebError(message, site: site)
@@ -418,12 +418,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         name.controlSize = .large; name.setAccessibilityLabel("网站名称")
         stack.addArrangedSubview(name); nameInput = name
         name.delegate = self
-        let preview = NSBox(); preview.boxType = .custom; preview.borderWidth = 1
+        let preview = NSBox(); preview.boxType = .custom; preview.borderWidth = 1; preview.titlePosition = .noTitle
         preview.borderColor = .separatorColor; preview.cornerRadius = 6; preview.contentViewMargins = NSSize(width: 10, height: 10)
         let icon = NSImageView(); let title = label(""); let domain = label("", size: 12, color: .secondaryLabelColor)
         let words = NSStackView(views: [title, domain]); words.orientation = .vertical; words.alignment = .leading; words.spacing = 4
         let previewRow = NSStackView(views: [icon, words]); previewRow.orientation = .horizontal; previewRow.spacing = 12
+        previewRow.alignment = .centerY
         previewRow.translatesAutoresizingMaskIntoConstraints = false; preview.contentView!.addSubview(previewRow)
+        // NSBox's autoresized content view does not propagate its content's height.
+        preview.heightAnchor.constraint(equalTo: previewRow.heightAnchor, constant: 22).isActive = true
         NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: 28), icon.heightAnchor.constraint(equalToConstant: 28), previewRow.leadingAnchor.constraint(equalTo: preview.contentView!.leadingAnchor), previewRow.trailingAnchor.constraint(equalTo: preview.contentView!.trailingAnchor), previewRow.topAnchor.constraint(equalTo: preview.contentView!.topAnchor), previewRow.bottomAnchor.constraint(equalTo: preview.contentView!.bottomAnchor)])
         previewBox = preview; previewIcon = icon; previewTitle = title; previewDomain = domain; stack.addArrangedSubview(preview)
         updatePreview()
@@ -508,10 +511,34 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         seconds.delegate = self; seconds.target = self; seconds.action = #selector(saveSleepSeconds(_:))
         seconds.isEnabled = store.preferences.sleepEnabled; sleepInput = seconds
         stack.addArrangedSubview(row("等待时间（秒）", trailing: seconds))
+        section("缓存", in: stack)
+        let clear = ActionButton(clearingCache ? "正在清理…" : "清理缓存") { [weak self] in self?.clearCache() }
+        clear.isEnabled = !clearingCache; cacheButton = clear
+        stack.addArrangedSubview(row("网页与图标缓存", trailing: clear))
         let buttons = NSStackView(); buttons.orientation = .horizontal; buttons.distribution = .gravityAreas
         buttons.addView(ActionButton("退出 Slidebox") { NSApp.terminate(nil) }, in: .trailing)
         stack.addArrangedSubview(buttons)
         fillPageWidth(stack)
+    }
+
+    private func clearCache() {
+        guard !clearingCache else { return }
+        clearingCache = true; updateCacheButton("正在清理…")
+        Task { @MainActor [self] in
+            await pages.clearCache()
+            clearingCache = false
+            do {
+                try SiteIcons.shared.clearCache()
+                updateCacheButton("✓ 清理完成")
+            } catch {
+                updateCacheButton("清理失败，重试", help: error.localizedDescription)
+            }
+        }
+    }
+
+    private func updateCacheButton(_ title: String, help: String? = nil) {
+        cacheButton?.title = title; cacheButton?.setAccessibilityLabel(title)
+        cacheButton?.isEnabled = !clearingCache; cacheButton?.toolTip = help
     }
 
     @objc private func toggleLogin(_ sender: NSSwitch) {
@@ -596,7 +623,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         for size in [NSSize(width: 360, height: 300), NSSize(width: 480, height: 680), NSSize(width: 720, height: 500)] {
             panel.setContentSize(size)
             for settings in [false, true] {
-                if settings { renderSettings() } else { renderAdd() }
+                if settings { renderSettings() } else {
+                    renderAdd()
+                    addressInput?.stringValue = "https://mail.google.com/mail/u/0/#inbox"
+                    nameInput?.stringValue = "GMail"
+                    updatePreview()
+                }
                 panel.contentView!.layoutSubtreeIfNeeded()
                 guard let scroll = content.subviews.compactMap({ $0 as? NSScrollView }).first,
                       let document = scroll.documentView,
@@ -606,12 +638,48 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                     && stack.frame.width > 200 && stack.frame.height > 100
                 print("Layout \(settings ? "settings" : "add") \(size): scroll=\(scroll.frame), document=\(document.frame), stack=\(stack.frame)")
                 guard valid else { print("FAIL: form content is collapsed or outside the viewport"); return false }
+                if settings {
+                    let button = cacheButton!
+                    clearingCache = true; updateCacheButton("正在清理…")
+                    precondition(!button.isEnabled)
+                    clearingCache = false; updateCacheButton("✓ 清理完成")
+                    precondition(cacheButton === button && button.isEnabled && button.title == "✓ 清理完成")
+                    precondition(button.accessibilityLabel() == button.title)
+                    panel.contentView!.layoutSubtreeIfNeeded()
+                }
                 if !settings {
                     for field in [addressInput!, nameInput!] {
                         guard abs(field.frame.height - field.intrinsicContentSize.height) < 1 else {
                             print("FAIL: input height differs from native text-field height"); return false
                         }
                     }
+                    let box = previewBox!
+                    let icon = previewIcon!.convert(previewIcon!.bounds, to: box)
+                    let title = previewTitle!.convert(previewTitle!.bounds, to: box)
+                    let domain = previewDomain!.convert(previewDomain!.bounds, to: box)
+                    let words = title.union(domain)
+                    print("Preview: box=\(box.bounds), icon=\(icon), words=\(words)")
+                    guard box.bounds.insetBy(dx: 8, dy: 8).contains(icon),
+                          box.bounds.insetBy(dx: 8, dy: 8).contains(words),
+                          abs(icon.midY - words.midY) < 1,
+                          words.minX - icon.maxX >= 10 else {
+                        print("FAIL: preview content is clipped or misaligned"); return false
+                    }
+                }
+                if let output = ProcessInfo.processInfo.environment["SLIDEBOX_LAYOUT_OUTPUT"],
+                   let bitmap = document.bitmapImageRepForCachingDisplay(in: document.bounds) {
+                    document.cacheDisplay(in: document.bounds, to: bitmap)
+                    do {
+                        let directory = URL(fileURLWithPath: output, isDirectory: true)
+                        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                        let rendered = NSImage(size: document.bounds.size, flipped: false) { rect in
+                            NSColor.textBackgroundColor.setFill(); rect.fill()
+                            NSImage(cgImage: bitmap.cgImage!, size: rect.size).draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
+                            return true
+                        }
+                        try NSBitmapImageRep(data: rendered.tiffRepresentation!)!.representation(using: .png, properties: [:])!.write(to:
+                            directory.appendingPathComponent("\(settings ? "settings" : "add")-\(Int(size.width)).png"))
+                    } catch { print("FAIL: layout render: \(error)"); return false }
                 }
             }
         }
