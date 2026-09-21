@@ -312,7 +312,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 self.renderRail()
             }
             let menu = NSMenu()
-            for (title, action) in [("编辑网站", #selector(editSite(_:))), ("上移", #selector(moveUp(_:))), ("下移", #selector(moveDown(_:))), ("在默认浏览器打开", #selector(openSite(_:))), ("删除网站", #selector(deleteSite(_:)))] {
+            for (title, action) in [("回到设定页面", #selector(returnToSite(_:))), ("编辑网站", #selector(editSite(_:))), ("上移", #selector(moveUp(_:))), ("下移", #selector(moveDown(_:))), ("在默认浏览器打开", #selector(openSite(_:))), ("删除网站", #selector(deleteSite(_:)))] {
                 let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
                 item.target = self; item.representedObject = site.id.uuidString; menu.addItem(item)
             }
@@ -568,6 +568,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func id(_ sender: NSMenuItem) -> UUID? { (sender.representedObject as? String).flatMap(UUID.init(uuidString:)) }
+    @objc private func returnToSite(_ sender: NSMenuItem) {
+        guard let id = id(sender), store.sites.contains(where: { $0.id == id }) else { return }
+        pages.remove(id); select(id)
+    }
     @objc private func editSite(_ sender: NSMenuItem) { if let id = id(sender) { showAdd(id) } }
     @objc private func openSite(_ sender: NSMenuItem) { if let site = store.sites.first(where: { $0.id == id(sender) }) { NSWorkspace.shared.open(site.url) } }
     @objc private func deleteSite(_ sender: NSMenuItem) {

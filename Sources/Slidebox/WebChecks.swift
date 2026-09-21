@@ -113,7 +113,39 @@ func runDataChecks() async throws {
     precondition(Store(defaults: defaults).sites == [site])
     print("PASS: icon memory/disk cache cleared; repeated clearing is safe")
 
-    _ = try await reopened.view.evaluateJavaScript("history.pushState({}, '', '/c/another')")
+    let other = Site(name: "Other page", url: url.appendingPathComponent("other"))
+    let search = URL(string: "/search?q=test", relativeTo: url)!.absoluteURL
+    for scenario in ["search", "SPA", "sleep", "already home"] {
+        let current = pages.activate(site)
+        if scenario == "search" {
+            current.view.load(URLRequest(url: search))
+            try await loaded(current, at: search)
+        } else if scenario != "already home" {
+            _ = try await current.view.evaluateJavaScript("history.pushState({}, '', '/search?q=test')")
+            precondition(current.view.url == search)
+        }
+        // Returning through another site's icon must activate the requested site.
+        let otherPage = pages.activate(other)
+        try await loaded(otherPage, at: other.url)
+        if scenario == "sleep" {
+            pages.expire(at: .now.advanced(by: .seconds(31)))
+            precondition(pages.pages[site.id] == nil)
+        }
+        pages.remove(site.id)
+        let home = pages.activate(site)
+        try await loaded(home, at: url)
+        precondition(home !== current && pages.active == site.id)
+        precondition(pages.pages[other.id] === otherPage)
+        precondition(store.sites == [site] && Store(defaults: defaults).sites == [site])
+        let login = try await home.view.evaluateJavaScript("document.cookie.includes('slidebox_login=keep') && localStorage.getItem('slidebox_login') === 'keep'") as? Bool
+        precondition(login == true, "Returning home removed login storage")
+        pages.suspendActive()
+        pages.expire(at: .now.advanced(by: .seconds(31)))
+        try await loaded(pages.activate(site), at: url)
+    }
+    print("PASS: return home after search, SPA, sleep and from home; target activation, bookmarks and login data preserved")
+
+    _ = try await pages.activate(site).view.evaluateJavaScript("history.pushState({}, '', '/c/another')")
     try await Task.sleep(for: .milliseconds(100))
     pages.dispose()
     try await loaded(pages.activate(site), at: url)

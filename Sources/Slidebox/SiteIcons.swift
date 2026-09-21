@@ -85,12 +85,11 @@ final class SiteIcons {
                         kCGImageSourceCreateThumbnailFromImageAlways: true,
                         kCGImageSourceThumbnailMaxPixelSize: 64
                       ] as CFDictionary),
-                      let png = NSBitmapImageRep(cgImage: thumbnail).representation(using: .png, properties: [:]),
-                      let image = NSImage(data: png) else { continue }
+                      let png = NSBitmapImageRep(cgImage: thumbnail).representation(using: .png, properties: [:]) else { continue }
                 guard generation == self.generation else { return }
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 try png.write(to: file(key), options: .atomic)
-                images.setObject(image, forKey: key as NSString)
+                images.setObject(NSImage(cgImage: thumbnail, size: .zero), forKey: key as NSString)
                 changed?()
                 return
             } catch { continue }
