@@ -3,6 +3,8 @@ import ServiceManagement
 import WebKit
 
 final class ActionButton: NSButton, NSDraggingSource {
+    var usesExactBounds = false
+    override var alignmentRectInsets: NSEdgeInsets { usesExactBounds ? NSEdgeInsetsZero : super.alignmentRectInsets }
     static let siteType = NSPasteboard.PasteboardType("local.slidebox.site")
     var siteID: UUID? {
         didSet { if siteID != nil { registerForDraggedTypes([Self.siteType]) } }
@@ -42,7 +44,10 @@ final class ActionButton: NSButton, NSDraggingSource {
         if let symbol {
             image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
             imagePosition = .imageOnly; isBordered = false
-        } else { bezelStyle = .rounded }
+        } else {
+            isBordered = true
+            bezelStyle = .rounded
+        }
         setAccessibilityLabel(title)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -78,10 +83,25 @@ final class EdgeView: NSView {
 
 @MainActor
 final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
-    private let store = Store()
+    private let store: Store
+    private var isolatedDefaultsName: String?
     private let pages = WebPages()
+    private var updates: AppUpdates!
+    private weak var updateStatus: NSTextField?
+    private weak var updateCheckButton: NSButton?
+    private weak var updateRevealButton: NSView?
     private var panel: SlidePanel!
-    private var rail: NSView!
+    private var rail: GlassSurface!
+    private var railContents = FlippedView()
+    private var siteScroll: NSScrollView!
+    private var siteList: NSView!
+    private var railTools: NSStackView!
+    private var railDivider: NSBox!
+    private var settingsOverlay: GlassSurface?
+    private var settingsScroll: NSScrollView?
+    private var addOverlay: GlassSurface?
+    private var addScroll: NSScrollView?
+    private var positionButtons: [ToolbarPosition: ActionButton] = [:]
     private var content: NSView!
     private var edges: [NSPanel] = []
     private var hover: DispatchWorkItem?
@@ -90,7 +110,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var visible = false
     private var transition = 0
     private var screen: NSScreen?
-    private var currentPage: Page = .website
     private var editing: UUID?
     private var addressInput: NSTextField?
     private var nameInput: NSTextField?
@@ -104,14 +123,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var previewTitle: NSTextField?
     private var previewDomain: NSTextField?
     private var previewIcon: NSImageView?
-    private enum Page { case website, add, settings }
+
+    override init() {
+        // Checks and previews never alter the installed application's preferences.
+        if CommandLine.arguments.contains("--layout-self-test") || (CommandLine.arguments.contains("--ui-preview") || Bundle.main.bundleIdentifier == "local.slidebox.glass-preview") {
+            let name = "local.slidebox.check.\(ProcessInfo.processInfo.processIdentifier)"
+            let defaults = UserDefaults(suiteName: name)!
+            defaults.removePersistentDomain(forName: name)
+            store = Store(defaults: defaults)
+            updates = AppUpdates(defaults: defaults)
+            isolatedDefaultsName = name
+        } else { store = Store(); updates = AppUpdates() }
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        if CommandLine.arguments.contains("--web-self-test") || CommandLine.arguments.contains("--memory-self-test") || CommandLine.arguments.contains("--browser-self-test") || CommandLine.arguments.contains("--data-self-test") {
+        if CommandLine.arguments.contains("--update-network-self-test") || CommandLine.arguments.contains("--web-self-test") || CommandLine.arguments.contains("--memory-self-test") || CommandLine.arguments.contains("--browser-self-test") || CommandLine.arguments.contains("--data-self-test") {
             Task { @MainActor in
                 do {
-                    if CommandLine.arguments.contains("--data-self-test") { try await runDataChecks() }
+                    if CommandLine.arguments.contains("--update-network-self-test") { try await runUpdateNetworkChecks() }
+                    else if CommandLine.arguments.contains("--data-self-test") { try await runDataChecks() }
                     else if CommandLine.arguments.contains("--browser-self-test") { try await runBrowserChecks() }
                     else if CommandLine.arguments.contains("--memory-self-test") { try await runMemoryChecks() }
                     else { try await runWebChecks(); print("PASS: real WebKit lifecycle checks") }
@@ -122,14 +154,27 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             return
         }
         SiteIcons.shared.changed = { [weak self] in
-            self?.renderRail()
+            self?.refreshSiteIcons()
             self?.updatePreview()
         }
+        updates.changed = { [weak self] in self?.refreshUpdateStatus() }
         makeWindow()
         pages.configureSleep(enabled: store.preferences.sleepEnabled, seconds: store.preferences.sleepSeconds)
         if CommandLine.arguments.contains("--layout-self-test") {
             exit(runLayoutChecks() ? 0 : 1)
         }
+        if (CommandLine.arguments.contains("--ui-preview") || Bundle.main.bundleIdentifier == "local.slidebox.glass-preview") {
+            NSApp.setActivationPolicy(.regular)
+            store.preferences.pinned = true
+            store.sites = [Site(name: "DeepSeek", url: URL(string: "https://chat.deepseek.com")!), Site(name: "ChatGPT", url: URL(string: "https://chatgpt.com")!)]
+            renderRail()
+            if let screen = NSScreen.main { show(on: screen) }
+            panel.title = "Slidebox — 本地设计预览"
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil); showAdd()
+            return
+        }
+        updates.check()
         rebuildEdges()
         notificationTokens.append(NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor [weak self] in self?.screensChanged() }
@@ -147,12 +192,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        updates.stop()
         hover?.cancel(); removeMonitors(); pages.dispose()
         edges.forEach { $0.close() }
         notificationTokens.forEach {
             NotificationCenter.default.removeObserver($0)
             NSWorkspace.shared.notificationCenter.removeObserver($0)
         }
+        clearCheckDefaults()
+    }
+
+    private func clearCheckDefaults() {
+        if let name = isolatedDefaultsName { UserDefaults(suiteName: name)?.removePersistentDomain(forName: name) }
     }
 
     private func makeWindow() {
@@ -167,17 +218,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let root = SurfaceView(color: .windowBackgroundColor)
         root.layer?.cornerRadius = 10; root.layer?.masksToBounds = true
         panel.contentView = root
-        rail = SurfaceView(color: .controlBackgroundColor)
-        (rail as? SurfaceView)?.showsResizeCursor = true
+        root.showsResizeCursor = true
+        rail = GlassSurface(radius: 20)
+        rail.body.addSubview(railContents)
+        rail.setAccessibilityLabel("玻璃浮岛工具栏")
         content = SurfaceView(color: .textBackgroundColor)
-        for view in [rail!, content!] { view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view) }
-        NSLayoutConstraint.activate([
-            rail.leadingAnchor.constraint(equalTo: root.leadingAnchor), rail.topAnchor.constraint(equalTo: root.topAnchor), rail.bottomAnchor.constraint(equalTo: root.bottomAnchor), rail.widthAnchor.constraint(equalToConstant: 36),
-            content.leadingAnchor.constraint(equalTo: rail.trailingAnchor), content.trailingAnchor.constraint(equalTo: root.trailingAnchor), content.topAnchor.constraint(equalTo: root.topAnchor), content.bottomAnchor.constraint(equalTo: root.bottomAnchor)
-        ])
-        let divider = NSBox(); divider.boxType = .separator; divider.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(divider)
-        NSLayoutConstraint.activate([divider.leadingAnchor.constraint(equalTo: rail.trailingAnchor), divider.topAnchor.constraint(equalTo: root.topAnchor), divider.bottomAnchor.constraint(equalTo: root.bottomAnchor), divider.widthAnchor.constraint(equalToConstant: 1)])
+        content.wantsLayer = true; content.layer?.cornerRadius = 10; content.layer?.masksToBounds = true
+        root.addSubview(content); root.addSubview(rail)
         renderRail()
     }
 
@@ -229,7 +276,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         self.screen = screen; visible = true; transition += 1
         let destination = panelFrame(on: screen)
         panel.setFrame(destination.offsetBy(dx: destination.width, dy: 0), display: false)
-        if currentPage == .website || content.subviews.isEmpty { renderCurrentPage() }
+        renderWebsite()
         panel.orderFrontRegardless()
         animate(to: destination)
         installMonitors()
@@ -247,6 +294,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func hide(animated: Bool = true) {
         guard visible else { return }
+        closeSettings()
         visible = false; transition += 1
         spinner?.stopAnimation(nil)
         let token = transition
@@ -262,8 +310,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func installMonitors() {
         removeMonitors()
         if let monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] _ in self?.outsideClick() }) { monitors.append(monitor) }
-        if let monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown], handler: { [weak self] event in
-            if event.window != self?.panel { self?.outsideClick() }
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown], handler: { [weak self] event in
+            guard let self else { return event }
+            if event.type == .keyDown {
+                if event.keyCode == 53 {
+                    if self.settingsOverlay != nil { self.closeSettings(); return nil }
+                    if self.addOverlay != nil { self.closeAdd(); return nil }
+                }
+                return event
+            }
+            if event.window == self.panel, let overlay = self.settingsOverlay ?? self.addOverlay {
+                let point = self.panel.contentView!.convert(event.locationInWindow, from: nil)
+                if !overlay.frame.contains(point) && !self.rail.frame.contains(point) {
+                    if self.settingsOverlay != nil { self.closeSettings() } else { self.closeAdd() }
+                }
+            }
+            if event.window != self.panel { self.outsideClick() }
             return event
         }) { monitors.append(monitor) }
     }
@@ -281,30 +343,33 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         store.preferences = preferences
     }
 
+    func windowDidResize(_ notification: Notification) {
+        if siteScroll != nil { layoutChrome() }
+    }
+
     private func railButton(_ title: String, symbol: String, selected: Bool = false, action: @escaping () -> Void) -> ActionButton {
         let button = ActionButton(title, symbol: symbol, action: action)
+        button.usesExactBounds = true
         button.toolTip = title; button.translatesAutoresizingMaskIntoConstraints = false
         button.contentTintColor = selected ? .controlAccentColor : .secondaryLabelColor
-        button.wantsLayer = true; button.layer?.cornerRadius = 6
+        button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 17, weight: .medium)
+        button.wantsLayer = true; button.layer?.cornerRadius = 14; button.layer?.masksToBounds = true
+        (button.cell as? NSButtonCell)?.highlightsBy = [.contentsCellMask]
         button.layer?.backgroundColor = selected ? NSColor.controlAccentColor.withAlphaComponent(0.12).cgColor : NSColor.clear.cgColor
         NSLayoutConstraint.activate([button.widthAnchor.constraint(equalToConstant: 28), button.heightAnchor.constraint(equalToConstant: 28)])
         return button
     }
 
     private func renderRail() {
-        rail.subviews.forEach { $0.removeFromSuperview() }
-        let top = NSStackView(); top.orientation = .vertical; top.spacing = 8
-        top.addArrangedSubview(railButton("收起", symbol: "chevron.right") { [weak self] in self?.hide() })
-        top.addArrangedSubview(railButton("固定侧栏", symbol: store.preferences.pinned ? "pin.fill" : "pin", selected: store.preferences.pinned) { [weak self] in
-            guard let self else { return }; self.store.preferences.pinned.toggle(); self.renderRail()
-            if self.currentPage == .settings { self.renderSettings() }
-        })
-        // Scroll only the site list, so add/settings remain reachable with many sites.
-        let list = NSStackView(); list.orientation = .vertical; list.spacing = 8; list.alignment = .centerX
-        for site in store.sites {
-            let selected = currentPage == .website && site.id == store.selected
+        railContents.subviews.forEach { $0.removeFromSuperview() }
+        let vertical = store.preferences.toolbarPosition.isVertical
+        siteList = FlippedView()
+        for (index, site) in store.sites.enumerated() {
+            let selected = site.id == store.selected
             let button = railButton(site.name, symbol: "globe", selected: selected) { [weak self] in self?.select(site.id) }
             button.image = siteIcon(site.url); button.imageScaling = .scaleProportionallyDown
+            button.translatesAutoresizingMaskIntoConstraints = true
+            button.frame = NSRect(x: vertical ? 0 : CGFloat(index) * 34, y: vertical ? CGFloat(index) * 34 : 0, width: 28, height: 28)
             button.siteID = site.id
             button.reorder = { [weak self] source, target in
                 guard let self else { return }
@@ -312,53 +377,97 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 self.renderRail()
             }
             let menu = NSMenu()
-            for (title, action) in [("回到设定页面", #selector(returnToSite(_:))), ("编辑网站", #selector(editSite(_:))), ("上移", #selector(moveUp(_:))), ("下移", #selector(moveDown(_:))), ("在默认浏览器打开", #selector(openSite(_:))), ("删除网站", #selector(deleteSite(_:)))] {
+            for (title, action) in [("回到设定页面", #selector(returnToSite(_:))), ("编辑网站", #selector(editSite(_:))), (vertical ? "上移" : "前移", #selector(moveUp(_:))), (vertical ? "下移" : "后移", #selector(moveDown(_:))), ("在默认浏览器打开", #selector(openSite(_:))), ("删除网站", #selector(deleteSite(_:)))] {
                 let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
                 item.target = self; item.representedObject = site.id.uuidString; menu.addItem(item)
             }
-            button.menu = menu; list.addArrangedSubview(button)
+            button.menu = menu; siteList.addSubview(button)
         }
-        let scroll = NSScrollView(); scroll.drawsBackground = false; scroll.hasVerticalScroller = false
-        let document = FlippedView(); document.translatesAutoresizingMaskIntoConstraints = false
-        list.translatesAutoresizingMaskIntoConstraints = false; document.addSubview(list); scroll.documentView = document
-        NSLayoutConstraint.activate([document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor), list.topAnchor.constraint(equalTo: document.topAnchor), list.bottomAnchor.constraint(equalTo: document.bottomAnchor), list.centerXAnchor.constraint(equalTo: document.centerXAnchor)])
-        let bottom = NSStackView(); bottom.orientation = .vertical; bottom.spacing = 8
-        bottom.addArrangedSubview(railButton("添加网站", symbol: "plus", selected: currentPage == .add) { [weak self] in self?.showAdd() })
-        bottom.addArrangedSubview(railButton("设置", symbol: "gearshape", selected: currentPage == .settings) { [weak self] in self?.showSettings() })
-        for view in [top, scroll, bottom] { view.translatesAutoresizingMaskIntoConstraints = false; rail.addSubview(view) }
-        NSLayoutConstraint.activate([
-            top.topAnchor.constraint(equalTo: rail.topAnchor, constant: 8), top.centerXAnchor.constraint(equalTo: rail.centerXAnchor),
-            bottom.bottomAnchor.constraint(equalTo: rail.bottomAnchor, constant: -12), bottom.centerXAnchor.constraint(equalTo: rail.centerXAnchor),
-            scroll.topAnchor.constraint(equalTo: top.bottomAnchor, constant: 8), scroll.bottomAnchor.constraint(equalTo: bottom.topAnchor, constant: -12), scroll.leadingAnchor.constraint(equalTo: rail.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: rail.trailingAnchor)
-        ])
+        // Only websites scroll; collapse/add/settings remain reachable at every size.
+        siteScroll = NSScrollView(); siteScroll.drawsBackground = false
+        siteScroll.hasVerticalScroller = false; siteScroll.hasHorizontalScroller = false
+        siteScroll.documentView = siteList
+        railTools = NSStackView(); railTools.orientation = vertical ? .vertical : .horizontal
+        railTools.spacing = 6
+        railTools.addArrangedSubview(railButton("收起", symbol: "play.fill") { [weak self] in self?.hide() })
+        railTools.addArrangedSubview(railButton("添加网站", symbol: "plus.circle", selected: addOverlay != nil && settingsOverlay == nil) { [weak self] in self?.showAdd() })
+        let settings = railButton("设置", symbol: "slider.horizontal.3", selected: settingsOverlay != nil) { [weak self] in self?.showSettings() }
+        railTools.addArrangedSubview(settings)
+        railDivider = NSBox(); railDivider.boxType = .separator
+        for view in [siteScroll!, railDivider!, railTools!] { railContents.addSubview(view) }
+        updateRailSelection()
+        layoutChrome()
+    }
+
+    private func layoutChrome() {
+        guard let root = panel.contentView, siteScroll != nil else { return }
+        let bounds = root.bounds, position = store.preferences.toolbarPosition
+        let vertical = position.isVertical
+        content.frame = bounds
+        let natural = max(0, CGFloat(store.sites.count) * 34 - 6)
+        let gap: CGFloat = store.sites.isEmpty ? 0 : 18
+        let length = min(natural + gap + 108, (vertical ? bounds.height : bounds.width) - 16)
+        let siteLength = max(0, length - 108 - gap)
+        switch position {
+        case .left: rail.frame = NSRect(x: 8, y: bounds.midY - length / 2, width: 40, height: length)
+        case .right: rail.frame = NSRect(x: bounds.maxX - 48, y: bounds.midY - length / 2, width: 40, height: length)
+        case .top: rail.frame = NSRect(x: bounds.midX - length / 2, y: bounds.maxY - 48, width: length, height: 40)
+        case .bottom: rail.frame = NSRect(x: bounds.midX - length / 2, y: 8, width: length, height: 40)
+        }
+        rail.layoutSubtreeIfNeeded(); railContents.frame = rail.bounds
+        siteScroll.frame = NSRect(x: 6, y: 6, width: vertical ? 28 : siteLength, height: vertical ? siteLength : 28)
+        siteList.frame = NSRect(x: 0, y: 0, width: vertical ? 28 : natural, height: vertical ? natural : 28)
+        siteScroll.isHidden = store.sites.isEmpty; railDivider.isHidden = store.sites.isEmpty
+        railDivider.frame = vertical ? NSRect(x: 10, y: 6 + siteLength + 8, width: 20, height: 1) : NSRect(x: 6 + siteLength + 8, y: 10, width: 1, height: 20)
+        railTools.frame = NSRect(x: vertical ? 6 : 6 + siteLength + gap, y: vertical ? 6 + siteLength + gap : 6, width: vertical ? 28 : 96, height: vertical ? 96 : 28)
+        railTools.layoutSubtreeIfNeeded()
+        layoutOverlays()
+    }
+
+    private func refreshSiteIcons() {
+        for case let button as ActionButton in siteList.subviews {
+            if let site = store.sites.first(where: { $0.id == button.siteID }) { button.image = siteIcon(site.url) }
+        }
+    }
+
+    private func updateRailSelection() {
+        for case let button as ActionButton in siteList.subviews {
+            setRailSelection(button, selected: button.siteID == store.selected)
+        }
+        for (index, view) in railTools.arrangedSubviews.enumerated() {
+            guard let button = view as? ActionButton else { continue }
+            setRailSelection(button, selected: index == 1 ? addOverlay != nil && settingsOverlay == nil : index == 2 && settingsOverlay != nil)
+            if index == 2 {
+                button.toolTip = updates.downloadedURL == nil ? "设置" : "设置：新版本已下载"
+                if updates.downloadedURL != nil { button.contentTintColor = .controlAccentColor }
+            }
+        }
+    }
+
+    private func setRailSelection(_ button: ActionButton, selected: Bool) {
+        button.contentTintColor = selected ? .controlAccentColor : .secondaryLabelColor
+        button.layer?.backgroundColor = selected ? NSColor.controlAccentColor.withAlphaComponent(0.12).cgColor : NSColor.clear.cgColor
     }
 
     private func clearContent() {
         spinner?.stopAnimation(nil)
         content.subviews.forEach { $0.removeFromSuperview() }
-        addressInput = nil; nameInput = nil; formError = nil; loginStatus = nil; spinner = nil
-        previewBox = nil; previewTitle = nil; previewDomain = nil; previewIcon = nil
-        sleepInput = nil
-        cacheButton = nil
+        spinner = nil
     }
 
     private func select(_ id: UUID) {
-        store.selected = id; currentPage = .website; editing = nil
-        renderRail(); renderWebsite()
+        closeSettings(); closeAdd()
+        store.selected = id
+        updateRailSelection(); renderWebsite()
     }
     private func renderCurrentPage() {
-        switch currentPage {
-        case .website: renderWebsite()
-        case .add: renderAdd()
-        case .settings: renderSettings()
-        }
-        renderRail()
+        closeSettings(); closeAdd()
+        renderWebsite(); renderRail()
     }
 
     private func renderWebsite() {
-        clearContent()
         guard let site = store.sites.first(where: { $0.id == store.selected }) else {
-            pages.suspendActive()
+            pages.suspendActive(); clearContent()
             let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 16
             stack.addArrangedSubview(label("Slidebox", size: 26, weight: .semibold))
             stack.addArrangedSubview(label("把常用网站放在手边", color: .secondaryLabelColor))
@@ -366,12 +475,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             center(stack); return
         }
         let page = pages.activate(site)
+        if page.view.superview === content { return }
+        clearContent()
         page.failed = { [weak self] message in
-            guard let self, self.visible, self.currentPage == .website, self.store.selected == site.id else { return }
+            guard let self, self.visible, self.store.selected == site.id else { return }
             self.showWebError(message, site: site)
         }
         page.loadingChanged = { [weak self] loading in
-            guard let self, self.store.selected == site.id, self.currentPage == .website else { return }
+            guard let self, self.store.selected == site.id else { return }
             self.spinner?.isHidden = !loading
             if loading { self.spinner?.startAnimation(nil) } else { self.spinner?.stopAnimation(nil) }
         }
@@ -394,29 +505,48 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func showAdd(_ id: UUID? = nil) {
-        pages.suspendActive(); editing = id; currentPage = .add; renderRail(); renderAdd()
+        let wasSettings = settingsOverlay != nil
+        closeSettings()
+        if addOverlay != nil, editing == id {
+            if !wasSettings { closeAdd() }
+            return
+        }
+        closeAdd(); editing = id; renderAdd()
         panel.makeKey(); if let addressInput { panel.makeFirstResponder(addressInput) }
     }
 
+    private func closeAdd() {
+        guard let overlay = addOverlay else { return }
+        panel.makeFirstResponder(nil)
+        overlay.removeFromSuperview(); addOverlay = nil; addScroll = nil; editing = nil
+        addressInput = nil; nameInput = nil; formError = nil
+        previewBox = nil; previewTitle = nil; previewDomain = nil; previewIcon = nil
+        updateRailSelection()
+        if let web = content.subviews.first(where: { $0 is WKWebView }) { panel.makeFirstResponder(web) }
+    }
+
     private func renderAdd() {
-        clearContent()
+        let id = editing
+        closeSettings(); closeAdd(); editing = id
+        let overlay = GlassSurface(radius: 18)
+        overlay.setAccessibilityLabel(id == nil ? "添加网站" : "编辑网站")
+        addOverlay = overlay; panel.contentView!.addSubview(overlay)
+        let (scroll, stack) = overlayStack(in: overlay)
+        addScroll = scroll
         let site = store.sites.first { $0.id == editing }
-        let stack = pageStack(title: site == nil ? "添加网站" : "编辑网站")
-        stack.addArrangedSubview(label(site == nil ? "添加网站" : "编辑网站", size: 22, weight: .semibold))
-        stack.addArrangedSubview(label("输入网址，添加到侧栏。", color: .secondaryLabelColor))
-        stack.setCustomSpacing(26, after: stack.arrangedSubviews.last!)
+        stack.addArrangedSubview(label(site == nil ? "添加网站" : "编辑网站", size: 18, weight: .semibold))
+        stack.setCustomSpacing(8, after: stack.arrangedSubviews.last!)
         stack.addArrangedSubview(label("网站地址"))
         let address = NSTextField(string: site?.url.absoluteString ?? "")
         address.bezelStyle = .roundedBezel
         address.controlSize = .large; address.font = .systemFont(ofSize: 14)
-        address.setAccessibilityLabel("网站地址"); stack.addArrangedSubview(address); addressInput = address
+        address.setAccessibilityLabel("网站地址"); stack.addArrangedSubview(glassInput(address)); addressInput = address
         address.delegate = self
-        stack.setCustomSpacing(22, after: address)
         stack.addArrangedSubview(label("网站名称"))
         let name = NSTextField(string: site?.name ?? "")
         name.bezelStyle = .roundedBezel; name.font = .systemFont(ofSize: 14)
         name.controlSize = .large; name.setAccessibilityLabel("网站名称")
-        stack.addArrangedSubview(name); nameInput = name
+        stack.addArrangedSubview(glassInput(name)); nameInput = name
         name.delegate = self
         let preview = NSBox(); preview.boxType = .custom; preview.borderWidth = 1; preview.titlePosition = .noTitle
         preview.borderColor = .separatorColor; preview.cornerRadius = 6; preview.contentViewMargins = NSSize(width: 10, height: 10)
@@ -430,34 +560,43 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: 28), icon.heightAnchor.constraint(equalToConstant: 28), previewRow.leadingAnchor.constraint(equalTo: preview.contentView!.leadingAnchor), previewRow.trailingAnchor.constraint(equalTo: preview.contentView!.trailingAnchor), previewRow.topAnchor.constraint(equalTo: preview.contentView!.topAnchor), previewRow.bottomAnchor.constraint(equalTo: preview.contentView!.bottomAnchor)])
         previewBox = preview; previewIcon = icon; previewTitle = title; previewDomain = domain; stack.addArrangedSubview(preview)
         updatePreview()
-        let error = label("", color: .systemRed); stack.addArrangedSubview(error); formError = error
+        let error = label("", color: .systemRed); error.isHidden = true; stack.addArrangedSubview(error); formError = error
         let buttons = NSStackView(); buttons.orientation = .horizontal; buttons.spacing = 10; buttons.distribution = .gravityAreas
         let cancel = ActionButton("取消") { [weak self] in
-            guard let self else { return }; self.currentPage = .website; self.editing = nil; self.renderCurrentPage()
+            self?.closeAdd()
         }
         let add = ActionButton(site == nil ? "添加" : "保存") { [weak self] in self?.saveSite() }
         add.keyEquivalent = "\r"; add.bezelColor = .controlAccentColor
-        buttons.addView(cancel, in: .trailing); buttons.addView(add, in: .trailing); stack.addArrangedSubview(buttons)
+        buttons.addView(glassControl(cancel, width: 72), in: .trailing); buttons.addView(glassControl(add, width: 72), in: .trailing); stack.addArrangedSubview(buttons)
         fillPageWidth(stack)
+        updateRailSelection(); layoutOverlays()
     }
 
     private func saveSite() {
-        guard let url = websiteURL(addressInput?.stringValue ?? "") else { formError?.stringValue = "请输入有效的 HTTP 或 HTTPS 网址。"; return }
+        guard let url = websiteURL(addressInput?.stringValue ?? "") else { showFormError("请输入有效的 HTTP 或 HTTPS 网址。"); return }
         let title = nameInput?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard title.count <= 100 else { formError?.stringValue = "名称请保持在 100 个字符以内。"; return }
+        guard title.count <= 100 else { showFormError("名称请保持在 100 个字符以内。"); return }
         if let editing, let index = store.sites.firstIndex(where: { $0.id == editing }) {
-            pages.remove(editing); store.sites[index].url = url; store.sites[index].name = title.isEmpty ? defaultName(url) : title; select(editing)
+            pages.remove(editing); store.sites[index].url = url; store.sites[index].name = title.isEmpty ? defaultName(url) : title; renderRail(); select(editing)
         } else {
             let site = Site(name: title.isEmpty ? defaultName(url) : title, url: url)
-            store.sites.append(site); select(site.id)
+            store.sites.append(site); renderRail(); select(site.id)
         }
     }
 
-    func controlTextDidChange(_ notification: Notification) { updatePreview() }
+    private func showFormError(_ message: String) {
+        formError?.stringValue = message; formError?.isHidden = false
+        layoutOverlays()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        if let field = notification.object as? NSTextField, field === addressInput || field === nameInput { updatePreview() }
+    }
     func controlTextDidEndEditing(_ notification: Notification) {
         if let field = notification.object as? NSTextField, field === sleepInput { saveSleepSeconds(field) }
     }
     private func updatePreview() {
+        defer { if addOverlay != nil { layoutOverlays() } }
         guard let url = websiteURL(addressInput?.stringValue ?? "") else { previewBox?.isHidden = true; return }
         previewBox?.isHidden = false
         let name = nameInput?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -484,41 +623,207 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func showSettings() {
-        pages.suspendActive(); currentPage = .settings; renderRail(); renderSettings()
+        if settingsOverlay != nil { closeSettings(); return }
+        renderSettings()
+        panel.makeKey()
+    }
+
+    private func closeSettings() {
+        guard let overlay = settingsOverlay else { return }
+        // Commit the seconds field before removing its editor or changing placement.
+        panel.makeFirstResponder(nil)
+        overlay.removeFromSuperview(); settingsOverlay = nil
+        settingsScroll = nil; positionButtons.removeAll()
+        sleepInput = nil; loginStatus = nil; cacheButton = nil
+        updateStatus = nil; updateCheckButton = nil; updateRevealButton = nil
+        addOverlay?.isHidden = false
+        updateRailSelection()
+        if let web = content.subviews.first(where: { $0 is WKWebView }) { panel.makeFirstResponder(web) }
+    }
+
+    private func setToolbarPosition(_ position: ToolbarPosition) {
+        panel.makeFirstResponder(nil)
+        let changed = store.preferences.toolbarPosition != position
+        if changed { store.preferences.toolbarPosition = position }
+        for (value, button) in positionButtons {
+            button.state = value == position ? .on : .off
+            button.setAccessibilityValue(value == position ? 1 : 0)
+            button.contentTintColor = value == position ? .controlAccentColor : .labelColor
+            let background = button.superview
+            background?.wantsLayer = true; background?.layer?.cornerRadius = 10
+            background?.layer?.masksToBounds = true
+            background?.layer?.backgroundColor = value == position ? NSColor.controlAccentColor.withAlphaComponent(0.10).cgColor : NSColor.clear.cgColor
+        }
+        if changed { renderRail() } else { updateRailSelection() }
+    }
+
+    private func layoutOverlays() {
+        if let overlay = addOverlay, let scroll = addScroll { layoutOverlay(overlay, scroll: scroll) }
+        if let overlay = settingsOverlay, let scroll = settingsScroll { layoutOverlay(overlay, scroll: scroll) }
+    }
+
+    private func layoutOverlay(_ overlay: GlassSurface, scroll: NSScrollView) {
+        guard let root = panel.contentView else { return }
+        let bounds = root.bounds
+        let width = min(280, bounds.width - (store.preferences.toolbarPosition.isVertical ? 72 : 16))
+        let availableHeight = bounds.height - (store.preferences.toolbarPosition.isVertical ? 24 : 72)
+        // Measure at the constrained width so wrapped text determines the compact height.
+        overlay.setFrameSize(NSSize(width: width, height: max(32, min(overlay.frame.height, availableHeight))))
+        scroll.frame = overlay.bounds.insetBy(dx: 4, dy: 8)
+        overlay.layoutSubtreeIfNeeded()
+        let height = min(availableHeight, ceil(scroll.documentView?.fittingSize.height ?? availableHeight) + 16)
+        var frame = NSRect(x: 0, y: 0, width: width, height: height)
+        switch store.preferences.toolbarPosition {
+        case .left: frame.origin = NSPoint(x: rail.frame.maxX + 8, y: bounds.midY - height / 2)
+        case .right: frame.origin = NSPoint(x: rail.frame.minX - 8 - width, y: bounds.midY - height / 2)
+        case .top: frame.origin = NSPoint(x: bounds.midX - width / 2, y: rail.frame.minY - 8 - height)
+        case .bottom: frame.origin = NSPoint(x: bounds.midX - width / 2, y: rail.frame.maxY + 8)
+        }
+        frame.origin.x = max(8, min(frame.origin.x, bounds.width - width - 8))
+        frame.origin.y = max(8, min(frame.origin.y, bounds.height - height - 8))
+        overlay.frame = frame
+        scroll.frame = overlay.bounds.insetBy(dx: 4, dy: 8)
+        overlay.layoutSubtreeIfNeeded()
     }
 
     private func renderSettings() {
-        clearContent()
-        let stack = pageStack(title: "设置")
-        stack.addArrangedSubview(label("Slidebox", size: 24, weight: .semibold))
-        section("通用", in: stack)
+        closeSettings()
+        addOverlay?.isHidden = true
+        let overlay = GlassSurface(radius: 18)
+        overlay.setAccessibilityLabel("设置")
+        settingsOverlay = overlay; panel.contentView!.addSubview(overlay)
+        let (scroll, stack) = overlayStack(in: overlay)
+        settingsScroll = scroll
+        stack.addArrangedSubview(label("设置", size: 18, weight: .semibold))
+        stack.addArrangedSubview(label("浮岛位置", weight: .medium))
+        let positions = NSStackView(); positions.orientation = .horizontal; positions.spacing = 8; positions.distribution = .fillEqually
+        for position in ToolbarPosition.allCases {
+            let button = ActionButton(position.title) { [weak self] in self?.setToolbarPosition(position) }
+            button.image = NSImage(systemSymbolName: position.symbol, accessibilityDescription: nil)
+            button.imagePosition = .imageAbove
+            button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+            button.setButtonType(.pushOnPushOff)
+            button.font = .systemFont(ofSize: 12)
+            (button.cell as? NSButtonCell)?.showsStateBy = []
+            button.setAccessibilityRole(.radioButton)
+            button.setAccessibilityLabel("浮岛位置：" + position.title)
+            positions.addArrangedSubview(glassControl(button, height: 46)); positionButtons[position] = button
+        }
+        stack.addArrangedSubview(positions)
+        let divider = NSBox(); divider.boxType = .separator
+        divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        stack.addArrangedSubview(divider)
         let login = NSSwitch(); login.target = self; login.action = #selector(toggleLogin(_:)); login.setAccessibilityLabel("登录时自动启动")
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        stack.addArrangedSubview(row("登录时自动启动", trailing: login))
+        stack.addArrangedSubview(row("登录时自动启动", trailing: glassControl(login, width: 48)))
         let status = label("", size: 11, color: .secondaryLabelColor); loginStatus = status
-        if SMAppService.mainApp.status == .requiresApproval { status.stringValue = "请在系统设置的登录项中允许 Slidebox。" }
+        status.isHidden = SMAppService.mainApp.status != .requiresApproval
+        if !status.isHidden { status.stringValue = "请在系统设置的登录项中允许 Slidebox。" }
         stack.addArrangedSubview(status)
-        section("窗口", in: stack)
-        let pin = NSSwitch(); pin.state = store.preferences.pinned ? .on : .off; pin.target = self; pin.action = #selector(togglePin(_:)); pin.setAccessibilityLabel("固定侧栏")
-        stack.addArrangedSubview(row("固定侧栏", trailing: pin))
+        let pin = NSSwitch(); pin.state = store.preferences.pinned ? .on : .off
+        pin.target = self; pin.action = #selector(togglePin(_:)); pin.setAccessibilityLabel("固定侧栏")
+        stack.addArrangedSubview(row("固定侧栏", trailing: glassControl(pin, width: 48)))
         section("网页休眠", in: stack)
         let sleep = NSSwitch(); sleep.state = store.preferences.sleepEnabled ? .on : .off
         sleep.target = self; sleep.action = #selector(toggleSleep(_:)); sleep.setAccessibilityLabel("自动休眠网页")
-        stack.addArrangedSubview(row("自动休眠网页", trailing: sleep))
+        stack.addArrangedSubview(row("自动休眠网页", trailing: glassControl(sleep, width: 48)))
         let seconds = NSTextField(string: String(store.preferences.sleepSeconds))
-        seconds.alignment = .left; seconds.widthAnchor.constraint(equalToConstant: 80).isActive = true
+        seconds.alignment = .left; seconds.isBordered = false; seconds.drawsBackground = false
+        seconds.font = .systemFont(ofSize: 13)
         seconds.setAccessibilityLabel("隐藏后等待秒数，1 至 86400")
         seconds.delegate = self; seconds.target = self; seconds.action = #selector(saveSleepSeconds(_:))
         seconds.isEnabled = store.preferences.sleepEnabled; sleepInput = seconds
-        stack.addArrangedSubview(row("等待时间（秒）", trailing: seconds))
+        let input = glassInput(seconds)
+        input.widthAnchor.constraint(equalToConstant: 76).isActive = true
+        stack.addArrangedSubview(row("等待时间（秒）", trailing: input))
         section("缓存", in: stack)
         let clear = ActionButton(clearingCache ? "正在清理…" : "清理缓存") { [weak self] in self?.clearCache() }
         clear.isEnabled = !clearingCache; cacheButton = clear
-        stack.addArrangedSubview(row("网页与图标缓存", trailing: clear))
+        stack.addArrangedSubview(row("网页与图标缓存", trailing: glassControl(clear, width: 104)))
+        section("软件更新", in: stack)
+        let automatic = NSSwitch(); automatic.state = updates.enabled ? .on : .off
+        automatic.target = self; automatic.action = #selector(toggleUpdates(_:)); automatic.setAccessibilityLabel("自动检查并下载更新")
+        stack.addArrangedSubview(row("自动检查并下载", trailing: glassControl(automatic, width: 48)))
+        let updateText = label(updates.message, size: 11, color: .secondaryLabelColor)
+        updateStatus = updateText; stack.addArrangedSubview(updateText)
+        let updateButtons = NSStackView(); updateButtons.orientation = .horizontal; updateButtons.spacing = 8
+        let check = ActionButton("检查更新") { [weak self] in self?.updates.check(manual: true) }
+        updateCheckButton = check; updateButtons.addArrangedSubview(glassControl(check, width: 100))
+        let reveal = glassControl(ActionButton("显示安装包") { [weak self] in
+            if let url = self?.updates.downloadedURL { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+        }, width: 110)
+        updateRevealButton = reveal; updateButtons.addArrangedSubview(reveal)
+        stack.addArrangedSubview(updateButtons)
         let buttons = NSStackView(); buttons.orientation = .horizontal; buttons.distribution = .gravityAreas
-        buttons.addView(ActionButton("退出 Slidebox") { NSApp.terminate(nil) }, in: .trailing)
+        buttons.addView(glassControl(ActionButton("退出 Slidebox") { NSApp.terminate(nil) }, width: 118), in: .trailing)
         stack.addArrangedSubview(buttons)
         fillPageWidth(stack)
+        setToolbarPosition(store.preferences.toolbarPosition)
+        refreshUpdateStatus()
+        layoutOverlays()
+    }
+
+    @objc private func toggleUpdates(_ sender: NSSwitch) { updates.setEnabled(sender.state == .on) }
+
+    private func refreshUpdateStatus() {
+        updateStatus?.stringValue = updates.message
+        updateCheckButton?.isEnabled = !updates.busy
+        updateRevealButton?.isHidden = updates.downloadedURL == nil
+        updateRailSelection()
+        if settingsOverlay != nil { layoutOverlays() }
+    }
+
+    private func overlayStack(in overlay: GlassSurface) -> (NSScrollView, NSStackView) {
+        let scroll = NSScrollView(); scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        overlay.body.addSubview(scroll)
+        let document = FlippedView(); document.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = document
+        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false; document.addSubview(stack)
+        NSLayoutConstraint.activate([
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -12)
+        ])
+        return (scroll, stack)
+    }
+
+    private func glassInput(_ field: NSTextField) -> GlassSurface {
+        let surface = GlassSurface(radius: 10)
+        field.focusRingType = .none
+        field.isBordered = false; field.drawsBackground = false
+        field.translatesAutoresizingMaskIntoConstraints = false; surface.body.addSubview(field)
+        NSLayoutConstraint.activate([
+            surface.heightAnchor.constraint(equalToConstant: 28),
+            field.leadingAnchor.constraint(equalTo: surface.body.leadingAnchor, constant: 8),
+            field.trailingAnchor.constraint(equalTo: surface.body.trailingAnchor, constant: -8),
+            field.centerYAnchor.constraint(equalTo: surface.body.centerYAnchor)
+        ])
+        return surface
+    }
+
+    private func glassControl(_ control: NSControl, width: CGFloat? = nil, height: CGFloat = 28) -> GlassSurface {
+        let surface = GlassSurface(radius: 10)
+        control.focusRingType = .none
+        if let button = control as? ActionButton {
+            button.isBordered = false; button.bezelStyle = .regularSquare
+            button.usesExactBounds = true
+            (button.cell as? NSButtonCell)?.highlightsBy = [.contentsCellMask]
+        }
+        control.translatesAutoresizingMaskIntoConstraints = false
+        surface.body.addSubview(control)
+        surface.heightAnchor.constraint(equalToConstant: height).isActive = true
+        if let width { surface.widthAnchor.constraint(equalToConstant: width).isActive = true }
+        NSLayoutConstraint.activate([
+            control.leadingAnchor.constraint(equalTo: surface.body.leadingAnchor, constant: 4),
+            control.trailingAnchor.constraint(equalTo: surface.body.trailingAnchor, constant: -4),
+            control.topAnchor.constraint(equalTo: surface.body.topAnchor, constant: 2),
+            control.bottomAnchor.constraint(equalTo: surface.body.bottomAnchor, constant: -2)
+        ])
+        return surface
     }
 
     private func clearCache() {
@@ -546,13 +851,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             if sender.state == .on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
             let status = SMAppService.mainApp.status
             loginStatus?.stringValue = status == .requiresApproval ? "请在系统设置的登录项中允许 Slidebox。" : ""
+            loginStatus?.isHidden = status != .requiresApproval
             sender.state = status == .enabled || status == .requiresApproval ? .on : .off
         } catch {
             sender.state = SMAppService.mainApp.status == .enabled ? .on : .off
             loginStatus?.stringValue = "操作失败：\(error.localizedDescription)"
+            loginStatus?.isHidden = false
         }
     }
-    @objc private func togglePin(_ sender: NSSwitch) { store.preferences.pinned = sender.state == .on; renderRail() }
+    @objc private func togglePin(_ sender: NSSwitch) { store.preferences.pinned = sender.state == .on }
     @objc private func toggleSleep(_ sender: NSSwitch) {
         store.preferences.sleepEnabled = sender.state == .on
         sleepInput?.isEnabled = store.preferences.sleepEnabled
@@ -582,7 +889,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             guard response == .alertFirstButtonReturn, let self else { return }
             self.pages.remove(id); self.store.sites.removeAll { $0.id == id }
             if self.store.selected == id { self.store.selected = self.store.sites.first?.id }
-            self.currentPage = .website; self.renderCurrentPage()
+            self.renderCurrentPage()
         }
     }
     @objc private func moveUp(_ sender: NSMenuItem) { move(sender, by: -1) }
@@ -602,11 +909,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func row(_ title: String, trailing: NSView) -> NSView {
         let view = NSView(); let text = label(title)
         for item in [text, trailing] { item.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(item) }
-        NSLayoutConstraint.activate([view.heightAnchor.constraint(greaterThanOrEqualToConstant: 32), text.leadingAnchor.constraint(equalTo: view.leadingAnchor), text.centerYAnchor.constraint(equalTo: view.centerYAnchor), trailing.trailingAnchor.constraint(equalTo: view.trailingAnchor), trailing.centerYAnchor.constraint(equalTo: view.centerYAnchor), text.trailingAnchor.constraint(lessThanOrEqualTo: trailing.leadingAnchor, constant: -8)])
+        NSLayoutConstraint.activate([view.heightAnchor.constraint(greaterThanOrEqualToConstant: 28), text.leadingAnchor.constraint(equalTo: view.leadingAnchor), text.centerYAnchor.constraint(equalTo: view.centerYAnchor), trailing.trailingAnchor.constraint(equalTo: view.trailingAnchor), trailing.centerYAnchor.constraint(equalTo: view.centerYAnchor), text.trailingAnchor.constraint(lessThanOrEqualTo: trailing.leadingAnchor, constant: -8)])
         return view
     }
     private func section(_ title: String, in stack: NSStackView) {
-        if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(22, after: last) }
+        if let last = stack.arrangedSubviews.last { stack.setCustomSpacing(12, after: last) }
         stack.addArrangedSubview(label(title, weight: .medium))
         let divider = NSBox(); divider.boxType = .separator
         divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
@@ -617,6 +924,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         NSLayoutConstraint.activate([view.centerXAnchor.constraint(equalTo: content.centerXAnchor), view.centerYAnchor.constraint(equalTo: content.centerYAnchor), view.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, constant: -48)])
     }
     private func runLayoutChecks() -> Bool {
+        defer { clearCheckDefaults() }
         for address in ["https://chat.deepseek.com", "https://chatgpt.com", "https://mail.google.com"] {
             guard let image = siteIcon(URL(string: address)!),
                   abs(max(image.size.width, image.size.height) - 18) < 0.01 else {
@@ -626,6 +934,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         print("PASS: website icons fit an 18pt box")
         for size in [NSSize(width: 360, height: 300), NSSize(width: 480, height: 680), NSSize(width: 720, height: 500)] {
             panel.setContentSize(size)
+            layoutChrome()
             for settings in [false, true] {
                 if settings { renderSettings() } else {
                     renderAdd()
@@ -634,11 +943,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                     updatePreview()
                 }
                 panel.contentView!.layoutSubtreeIfNeeded()
-                guard let scroll = content.subviews.compactMap({ $0 as? NSScrollView }).first,
+                guard let scroll = settings ? settingsScroll : addScroll,
                       let document = scroll.documentView,
                       let stack = document.subviews.first as? NSStackView else { return false }
-                let valid = abs(scroll.frame.height - (content.bounds.height - 47)) < 1
-                    && document.frame.width > 250 && document.frame.height > 100
+                let valid = document.frame.width > 250 && document.frame.height > 100
                     && stack.frame.width > 200 && stack.frame.height > 100
                 print("Layout \(settings ? "settings" : "add") \(size): scroll=\(scroll.frame), document=\(document.frame), stack=\(stack.frame)")
                 guard valid else { print("FAIL: form content is collapsed or outside the viewport"); return false }
@@ -687,30 +995,105 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 }
             }
         }
-        print("PASS: add/settings layout at three window sizes")
+        closeSettings()
+        for count in [0, 6, 40] {
+            store.sites = (0..<count).map { Site(name: "Site \($0)", url: URL(string: "https://example.com/\($0)")!) }
+            renderRail()
+            for position in ToolbarPosition.allCases {
+                for size in [NSSize(width: 360, height: 300), NSSize(width: 480, height: 680)] {
+                    panel.setContentSize(size); setToolbarPosition(position)
+                    let background = SurfaceView(color: .textBackgroundColor)
+                    background.frame = content.bounds; content.addSubview(background)
+                    let toolbarViews = railContents.subviews.map(ObjectIdentifier.init)
+                    renderAdd()
+                    precondition(railContents.subviews.map(ObjectIdentifier.init) == toolbarViews)
+                    nameInput?.stringValue = "未保存的名称"
+                    let underlyingViews = content.subviews.map(ObjectIdentifier.init)
+                    renderSettings(); positionButtons[position]!.performClick(nil); layoutChrome()
+                    precondition(railContents.subviews.map(ObjectIdentifier.init) == toolbarViews)
+                    precondition(addOverlay!.isHidden)
+                    precondition(railTools.arrangedSubviews.allSatisfy { $0.layer?.cornerRadius == 14 })
+                    let root = panel.contentView!
+                    root.layoutSubtreeIfNeeded()
+                    guard root.bounds.contains(rail.frame), root.bounds.contains(settingsOverlay!.frame),
+                          !rail.frame.intersects(settingsOverlay!.frame),
+                          content.frame == root.bounds, content.frame.contains(rail.frame),
+                          root.bounds.contains(addOverlay!.frame), !rail.frame.intersects(addOverlay!.frame),
+                          railTools.arrangedSubviews.count == 3,
+                          railContents.bounds.contains(railTools.frame),
+                          railTools.arrangedSubviews.allSatisfy({ abs($0.frame.width - 28) < 0.1 && abs($0.frame.height - 28) < 0.1 }) else {
+                        print("FAIL: unreachable toolbar or settings: \(position) \(size) \(count)"); return false
+                    }
+                    for button in positionButtons.values {
+                        guard let body = button.superview, let cell = button.cell as? NSButtonCell else { return false }
+                        precondition(body.bounds.insetBy(dx: 3, dy: 1).contains(button.frame))
+                        precondition(button.bounds.contains(cell.imageRect(forBounds: button.bounds)))
+                        precondition(button.bounds.contains(cell.titleRect(forBounds: button.bounds)))
+                    }
+                    precondition(positionButtons[position]?.state == .on)
+                    precondition(positionButtons.values.filter { $0.state == .on }.count == 1)
+                    precondition(cacheButton!.superview?.superview != nil)
+                    precondition(railTools.arrangedSubviews.compactMap { ($0 as? NSButton)?.toolTip } == ["收起", "添加网站", "设置"])
+                    let field = sleepInput!
+                    for bad in ["0", "86401", "abc"] {
+                        field.stringValue = bad; saveSleepSeconds(field)
+                        precondition(field.stringValue == String(store.preferences.sleepSeconds))
+                    }
+                    field.stringValue = "75"; saveSleepSeconds(field)
+                    precondition(store.preferences.sleepSeconds == 75)
+                    if let last = siteList.subviews.last {
+                        siteList.scrollToVisible(last.frame)
+                        precondition(siteScroll.documentVisibleRect.insetBy(dx: -1, dy: -1).contains(last.frame))
+                    }
+                    closeSettings()
+                    precondition(content.subviews.map(ObjectIdentifier.init) == underlyingViews)
+                    precondition(nameInput?.stringValue == "未保存的名称" && addOverlay?.isHidden == false)
+                    refreshSiteIcons()
+                    precondition(railContents.subviews.map(ObjectIdentifier.init) == toolbarViews)
+                    showAdd()
+                    precondition(addOverlay == nil && content.subviews.map(ObjectIdentifier.init) == underlyingViews)
+                    background.removeFromSuperview()
+                }
+            }
+        }
+        closeAdd()
+        let site = Site(name: "Local check", url: URL(string: "about:blank")!)
+        store.sites = [site]; renderRail(); select(site.id)
+        let web = content.subviews.first(where: { $0 is WKWebView })!
+        let mounted = content.subviews.map(ObjectIdentifier.init)
+        renderWebsite()
+        precondition(content.subviews.map(ObjectIdentifier.init) == mounted)
+        panel.setContentSize(NSSize(width: 480, height: 680)); setToolbarPosition(.left)
+        showAdd()
+        let emptyHeight = addOverlay!.frame.height
+        precondition(emptyHeight < 240 && addOverlay!.frame.width == 280)
+        addressInput!.stringValue = "https://example.com"; updatePreview()
+        precondition(addOverlay!.frame.height > emptyHeight)
+        addressInput!.stringValue = ""; updatePreview()
+        precondition(abs(addOverlay!.frame.height - emptyHeight) < 1)
+        let siteCount = store.sites.count
+        saveSite()
+        precondition(formError?.isHidden == false && store.sites.count == siteCount)
+        precondition(addOverlay!.frame.height > emptyHeight)
+        showSettings()
+        precondition(settingsOverlay!.frame.height < 600 && settingsOverlay!.frame.width == 280)
+        closeSettings(); closeAdd()
+        let started = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<20 {
+            showAdd(); nameInput?.stringValue = "草稿"
+            showSettings(); closeSettings()
+            precondition(nameInput?.stringValue == "草稿" && web.superview === content)
+            closeAdd()
+            precondition(content.subviews.map(ObjectIdentifier.init) == mounted)
+        }
+        let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000 / 20
+        print("Overlay create/close CPU-side wall time: \(String(format: "%.1f", elapsed)) ms/cycle (20 cycles, excludes display frame timing)")
+        print("PASS: full-page overlay, matched corners, add/settings draft retention, stable toolbar/web views, four positions and overflow")
         return true
     }
 
     private func fillPageWidth(_ stack: NSStackView) {
         for view in stack.arrangedSubviews { view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
-    }
-
-    private func pageStack(title: String) -> NSStackView {
-        let header = label(title, weight: .medium)
-        header.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(header)
-        let divider = NSBox(); divider.boxType = .separator; divider.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(divider)
-        let scroll = NSScrollView(); scroll.drawsBackground = false; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
-        scroll.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(scroll)
-        let document = FlippedView(); document.translatesAutoresizingMaskIntoConstraints = false; scroll.documentView = document
-        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
-        stack.translatesAutoresizingMaskIntoConstraints = false; document.addSubview(stack)
-        NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: content.topAnchor, constant: 14), header.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 28), header.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -28), header.heightAnchor.constraint(equalToConstant: 20),
-            divider.topAnchor.constraint(equalTo: content.topAnchor, constant: 46), divider.leadingAnchor.constraint(equalTo: content.leadingAnchor), divider.trailingAnchor.constraint(equalTo: content.trailingAnchor), divider.heightAnchor.constraint(equalToConstant: 1),
-            scroll.topAnchor.constraint(equalTo: divider.bottomAnchor), scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor), stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 28), stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -28), stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 28), stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -28)
-        ])
-        return stack
     }
 }
 

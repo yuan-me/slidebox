@@ -72,27 +72,32 @@ final class SiteIcons {
         for url in urls {
             guard generation == self.generation else { return }
             do {
-                let (bytes, response) = try await session.bytes(from: url)
-                guard let response = response as? HTTPURLResponse, response.statusCode == 200,
-                      response.expectedContentLength <= 524288 else { continue }
-                var data = Data()
-                for try await byte in bytes {
-                    data.append(byte)
-                    if data.count > 524288 { break }
-                }
-                guard data.count <= 524288, let source = CGImageSourceCreateWithData(data as CFData, nil),
-                      let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                        kCGImageSourceCreateThumbnailFromImageAlways: true,
-                        kCGImageSourceThumbnailMaxPixelSize: 64
-                      ] as CFDictionary),
-                      let png = NSBitmapImageRep(cgImage: thumbnail).representation(using: .png, properties: [:]) else { continue }
+                guard let thumbnail = try await Self.thumbnail(url, session: session) else { continue }
                 guard generation == self.generation else { return }
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                try png.write(to: file(key), options: .atomic)
-                images.setObject(NSImage(cgImage: thumbnail, size: .zero), forKey: key as NSString)
+                try thumbnail.png.write(to: file(key), options: .atomic)
+                images.setObject(NSImage(cgImage: thumbnail.image, size: .zero), forKey: key as NSString)
                 changed?()
                 return
             } catch { continue }
         }
     }
+    private nonisolated static func thumbnail(_ url: URL, session: URLSession) async throws -> (image: CGImage, png: Data)? {
+        let (bytes, response) = try await session.bytes(from: url)
+        guard let response = response as? HTTPURLResponse, response.statusCode == 200,
+              response.expectedContentLength <= 524288 else { return nil }
+        var data = Data()
+        for try await byte in bytes {
+            data.append(byte)
+            if data.count > 524288 { break }
+        }
+        guard data.count <= 524288, let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: 64
+              ] as CFDictionary),
+              let png = NSBitmapImageRep(cgImage: thumbnail).representation(using: .png, properties: [:]) else { return nil }
+        return (thumbnail, png)
+    }
+
 }

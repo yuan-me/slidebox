@@ -6,6 +6,8 @@
 
 - 鼠标移到屏幕边缘即可展开，支持拖动排序、调整窗口大小和固定窗口。
 - 网页隐藏后默认 30 秒休眠，释放内存；再次展开时重新加载。可关闭休眠或自定义时间。
+- 网页内玻璃浮岛支持四向位置，添加与设置使用紧凑浮层。
+- 自动检查 GitHub 正式版并下载、校验，手动替换安装。
 - 不预加载网页，不轮询鼠标，无第三方代码依赖。
 
 支持 **macOS 15+ · Apple Silicon / Intel**。
@@ -20,6 +22,8 @@ A free, open-source macOS sidebar browser built with Swift and system WebKit for
 
 - Hover at the screen edge to open. Drag to reorder websites, resize the window, or pin it in place.
 - Hidden pages sleep after 30 seconds to free memory and reload when reopened. Turn sleep off or set your own delay.
+- A floating glass toolbar with four positions and compact settings/add-site overlays.
+- Automatically check GitHub releases and download verified updates for manual installation.
 - No webpage preloading, mouse polling, or third-party code dependencies.
 
 Requires **macOS 15+ · Apple Silicon / Intel**.
@@ -28,15 +32,9 @@ Sleep keeps login data, but unsent input and responses still being generated may
 
 [Download](https://github.com/yuan-me/slidebox/releases/latest) · [MIT License](LICENSE)
 
-## 截图 / Screenshots
-
-| 主窗口 / Main | 设置 / Settings | 添加网站 / Add website |
-| --- | --- | --- |
-| [![主窗口 / Main](docs/screenshots/main.png)](docs/screenshots/main.png) | [![设置 / Settings](docs/screenshots/settings.png)](docs/screenshots/settings.png) | [![添加网站 / Add website](docs/screenshots/add-website.png)](docs/screenshots/add-website.png) |
-
 ## 构建 / Build
 
-Swift 6+ / Apple Command Line Tools
+Swift 6+ / macOS 26+ SDK（构建需要 Xcode 26+ 或对应 Command Line Tools）
 
 ```sh
 bash scripts/build.sh

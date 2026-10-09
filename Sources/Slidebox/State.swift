@@ -13,14 +13,31 @@ func reorderedSites(_ sites: [Site], source: UUID, target: UUID) -> [Site] {
     return result
 }
 
+enum ToolbarPosition: String, Codable, CaseIterable {
+    case left, right, top, bottom
+    var isVertical: Bool { self == .left || self == .right }
+    var title: String {
+        switch self { case .left: return "左"; case .right: return "右"; case .top: return "上"; case .bottom: return "下" }
+    }
+    var symbol: String {
+        switch self {
+        case .left: return "sidebar.left"
+        case .right: return "sidebar.right"
+        case .top: return "rectangle.topthird.inset.filled"
+        case .bottom: return "rectangle.bottomthird.inset.filled"
+        }
+    }
+}
+
 struct Preferences: Codable, Equatable {
     var width: Double = 480
     var height: Double = 680
     var pinned = false
     var sleepEnabled = true
     var sleepSeconds = 30
+    var toolbarPosition: ToolbarPosition = .left
     init() {}
-    private enum CodingKeys: String, CodingKey { case width, height, pinned, sleepEnabled, sleepSeconds }
+    private enum CodingKeys: String, CodingKey { case width, height, pinned, sleepEnabled, sleepSeconds, toolbarPosition }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         width = try values.decodeIfPresent(Double.self, forKey: .width) ?? 480
@@ -28,6 +45,7 @@ struct Preferences: Codable, Equatable {
         pinned = try values.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
         sleepEnabled = try values.decodeIfPresent(Bool.self, forKey: .sleepEnabled) ?? true
         sleepSeconds = max(1, min(86400, try values.decodeIfPresent(Int.self, forKey: .sleepSeconds) ?? 30))
+        toolbarPosition = (try values.decodeIfPresent(String.self, forKey: .toolbarPosition)).flatMap(ToolbarPosition.init(rawValue:)) ?? .left
     }
 }
 
@@ -90,6 +108,7 @@ final class Store {
 }
 
 func runChecks() throws {
+    try runUpdateChecks()
     precondition(websiteURL(" chat.deepseek.com ")?.absoluteString == "https://chat.deepseek.com")
     precondition(websiteURL("https://chatgpt.com/c/example?q=a%20b")?.path == "/c/example")
     precondition(websiteURL("http://localhost:8080") != nil)
@@ -129,6 +148,14 @@ func runChecks() throws {
     let oldPreferences = try JSONDecoder().decode(Preferences.self, from: Data(#"{"width":520,"pinned":true}"#.utf8))
     precondition(oldPreferences.width == 520 && oldPreferences.height == 680 && oldPreferences.pinned)
     precondition(oldPreferences.sleepEnabled && oldPreferences.sleepSeconds == 30)
+    precondition(oldPreferences.toolbarPosition == .left)
+    let futurePreferences = try JSONDecoder().decode(Preferences.self, from: Data(#"{"toolbarPosition":"unknown","sleepSeconds":75}"#.utf8))
+    precondition(futurePreferences.toolbarPosition == .left && futurePreferences.sleepSeconds == 75)
+    for position in ToolbarPosition.allCases {
+        var preferences = oldPreferences; preferences.toolbarPosition = position
+        let roundTrip = try JSONDecoder().decode(Preferences.self, from: JSONEncoder().encode(preferences))
+        precondition(roundTrip == preferences)
+    }
     var resized = Preferences()
     resized.width = 620; resized.height = 450
     resized.sleepEnabled = false; resized.sleepSeconds = 75
