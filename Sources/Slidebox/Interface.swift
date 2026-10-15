@@ -91,7 +91,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private weak var updateCheckButton: NSButton?
     private weak var updateRevealButton: NSView?
     private var panel: SlidePanel!
-    private var rail: GlassSurface!
+    private var rail: SidebarSurface!
+    private let railEdge = NSBox()
     private var railContents = FlippedView()
     private var siteScroll: NSScrollView!
     private var siteList: NSView!
@@ -215,15 +216,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         panel.isMovable = false; panel.hasShadow = true
         panel.isOpaque = false; panel.backgroundColor = .clear
         panel.minSize = NSSize(width: 360, height: 300)
-        let root = SurfaceView(color: .windowBackgroundColor)
+        let root = SurfaceView(color: .clear)
         root.layer?.cornerRadius = 10; root.layer?.masksToBounds = true
         panel.contentView = root
         root.showsResizeCursor = true
-        rail = GlassSurface(radius: 20)
-        rail.body.addSubview(railContents)
-        rail.setAccessibilityLabel("玻璃浮岛工具栏")
+        rail = SidebarSurface()
+        rail.addSubview(railContents)
+        railEdge.boxType = .separator; rail.addSubview(railEdge)
+        rail.setAccessibilityLabel("网站工具栏")
         content = SurfaceView(color: .textBackgroundColor)
-        content.wantsLayer = true; content.layer?.cornerRadius = 10; content.layer?.masksToBounds = true
+        content.wantsLayer = true; content.layer?.masksToBounds = true
         root.addSubview(content); root.addSubview(rail)
         renderRail()
     }
@@ -321,7 +323,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
             if event.window == self.panel, let overlay = self.settingsOverlay ?? self.addOverlay {
                 let point = self.panel.contentView!.convert(event.locationInWindow, from: nil)
-                if !overlay.frame.contains(point) && !self.rail.frame.contains(point) {
+                let buttons = self.railContents.convert(self.railContents.bounds, to: self.panel.contentView)
+                if !overlay.frame.contains(point) && !buttons.contains(point) {
                     if self.settingsOverlay != nil { self.closeSettings() } else { self.closeAdd() }
                 }
             }
@@ -403,23 +406,31 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         guard let root = panel.contentView, siteScroll != nil else { return }
         let bounds = root.bounds, position = store.preferences.toolbarPosition
         let vertical = position.isVertical
-        content.frame = bounds
+        let edge: CGRectEdge
+        switch position {
+        case .left: edge = .minXEdge
+        case .right: edge = .maxXEdge
+        case .top: edge = .maxYEdge
+        case .bottom: edge = .minYEdge
+        }
+        let regions = bounds.divided(atDistance: 32, from: edge)
+        rail.frame = regions.slice; content.frame = regions.remainder
         let natural = max(0, CGFloat(store.sites.count) * 34 - 6)
         let gap: CGFloat = store.sites.isEmpty ? 0 : 18
         let length = min(natural + gap + 108, (vertical ? bounds.height : bounds.width) - 16)
         let siteLength = max(0, length - 108 - gap)
-        switch position {
-        case .left: rail.frame = NSRect(x: 8, y: bounds.midY - length / 2, width: 40, height: length)
-        case .right: rail.frame = NSRect(x: bounds.maxX - 48, y: bounds.midY - length / 2, width: 40, height: length)
-        case .top: rail.frame = NSRect(x: bounds.midX - length / 2, y: bounds.maxY - 48, width: length, height: 40)
-        case .bottom: rail.frame = NSRect(x: bounds.midX - length / 2, y: 8, width: length, height: 40)
-        }
-        rail.layoutSubtreeIfNeeded(); railContents.frame = rail.bounds
-        siteScroll.frame = NSRect(x: 6, y: 6, width: vertical ? 28 : siteLength, height: vertical ? siteLength : 28)
+        railContents.frame = vertical
+            ? NSRect(x: 0, y: rail.bounds.midY - length / 2, width: 32, height: length)
+            : NSRect(x: rail.bounds.midX - length / 2, y: 0, width: length, height: 32)
+        railEdge.frame = vertical
+            ? NSRect(x: position == .left ? rail.bounds.width - 1 : 0, y: 0, width: 1, height: rail.bounds.height)
+            : NSRect(x: 0, y: position == .bottom ? rail.bounds.height - 1 : 0, width: rail.bounds.width, height: 1)
+        rail.layoutSubtreeIfNeeded()
+        siteScroll.frame = NSRect(x: vertical ? 2 : 6, y: vertical ? 6 : 2, width: vertical ? 28 : siteLength, height: vertical ? siteLength : 28)
         siteList.frame = NSRect(x: 0, y: 0, width: vertical ? 28 : natural, height: vertical ? natural : 28)
         siteScroll.isHidden = store.sites.isEmpty; railDivider.isHidden = store.sites.isEmpty
-        railDivider.frame = vertical ? NSRect(x: 10, y: 6 + siteLength + 8, width: 20, height: 1) : NSRect(x: 6 + siteLength + 8, y: 10, width: 1, height: 20)
-        railTools.frame = NSRect(x: vertical ? 6 : 6 + siteLength + gap, y: vertical ? 6 + siteLength + gap : 6, width: vertical ? 28 : 96, height: vertical ? 96 : 28)
+        railDivider.frame = vertical ? NSRect(x: 6, y: 6 + siteLength + 8, width: 20, height: 1) : NSRect(x: 6 + siteLength + 8, y: 6, width: 1, height: 20)
+        railTools.frame = NSRect(x: vertical ? 2 : 6 + siteLength + gap, y: vertical ? 6 + siteLength + gap : 2, width: vertical ? 28 : 96, height: vertical ? 96 : 28)
         railTools.layoutSubtreeIfNeeded()
         layoutOverlays()
     }
@@ -663,10 +674,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func layoutOverlay(_ overlay: GlassSurface, scroll: NSScrollView) {
-        guard let root = panel.contentView else { return }
-        let bounds = root.bounds
-        let width = min(280, bounds.width - (store.preferences.toolbarPosition.isVertical ? 72 : 16))
-        let availableHeight = bounds.height - (store.preferences.toolbarPosition.isVertical ? 24 : 72)
+        let bounds = content.frame
+        let width = min(280, bounds.width - 16)
+        let availableHeight = bounds.height - 16
         // Measure at the constrained width so wrapped text determines the compact height.
         overlay.setFrameSize(NSSize(width: width, height: max(32, min(overlay.frame.height, availableHeight))))
         scroll.frame = overlay.bounds.insetBy(dx: 4, dy: 8)
@@ -679,8 +689,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         case .top: frame.origin = NSPoint(x: bounds.midX - width / 2, y: rail.frame.minY - 8 - height)
         case .bottom: frame.origin = NSPoint(x: bounds.midX - width / 2, y: rail.frame.maxY + 8)
         }
-        frame.origin.x = max(8, min(frame.origin.x, bounds.width - width - 8))
-        frame.origin.y = max(8, min(frame.origin.y, bounds.height - height - 8))
+        frame.origin.x = max(bounds.minX + 8, min(frame.origin.x, bounds.maxX - width - 8))
+        frame.origin.y = max(bounds.minY + 8, min(frame.origin.y, bounds.maxY - height - 8))
         overlay.frame = frame
         scroll.frame = overlay.bounds.insetBy(dx: 4, dy: 8)
         overlay.layoutSubtreeIfNeeded()
@@ -695,7 +705,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let (scroll, stack) = overlayStack(in: overlay)
         settingsScroll = scroll
         stack.addArrangedSubview(label("设置", size: 18, weight: .semibold))
-        stack.addArrangedSubview(label("浮岛位置", weight: .medium))
+        stack.addArrangedSubview(label("工具栏位置", weight: .medium))
         let positions = NSStackView(); positions.orientation = .horizontal; positions.spacing = 8; positions.distribution = .fillEqually
         for position in ToolbarPosition.allCases {
             let button = ActionButton(position.title) { [weak self] in self?.setToolbarPosition(position) }
@@ -706,7 +716,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             button.font = .systemFont(ofSize: 12)
             (button.cell as? NSButtonCell)?.showsStateBy = []
             button.setAccessibilityRole(.radioButton)
-            button.setAccessibilityLabel("浮岛位置：" + position.title)
+            button.setAccessibilityLabel("工具栏位置：" + position.title)
             positions.addArrangedSubview(glassControl(button, height: 46)); positionButtons[position] = button
         }
         stack.addArrangedSubview(positions)
@@ -1017,12 +1027,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                     root.layoutSubtreeIfNeeded()
                     guard root.bounds.contains(rail.frame), root.bounds.contains(settingsOverlay!.frame),
                           !rail.frame.intersects(settingsOverlay!.frame),
-                          content.frame == root.bounds, content.frame.contains(rail.frame),
+                          !content.frame.intersects(rail.frame), content.frame.union(rail.frame) == root.bounds,
+                          content.frame.width == root.bounds.width - (position.isVertical ? 32 : 0),
+                          content.frame.height == root.bounds.height - (position.isVertical ? 0 : 32),
+                          rail.bounds.contains(railContents.frame), rail.bounds.contains(railEdge.frame),
+                          content.frame.contains(settingsOverlay!.frame),
+                          content.frame.contains(addOverlay!.frame),
                           root.bounds.contains(addOverlay!.frame), !rail.frame.intersects(addOverlay!.frame),
                           railTools.arrangedSubviews.count == 3,
                           railContents.bounds.contains(railTools.frame),
+                          (siteScroll.isHidden || railContents.bounds.contains(siteScroll.frame)),
+                          railContents.bounds.contains(railDivider.frame),
                           railTools.arrangedSubviews.allSatisfy({ abs($0.frame.width - 28) < 0.1 && abs($0.frame.height - 28) < 0.1 }) else {
-                        print("FAIL: unreachable toolbar or settings: \(position) \(size) \(count)"); return false
+                        print("FAIL: overlapping page/sidebar or unreachable controls: \(position) \(size) \(count)"); return false
                     }
                     for button in positionButtons.values {
                         guard let body = button.superview, let cell = button.cell as? NSButtonCell else { return false }
@@ -1063,6 +1080,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let mounted = content.subviews.map(ObjectIdentifier.init)
         renderWebsite()
         precondition(content.subviews.map(ObjectIdentifier.init) == mounted)
+        for position in ToolbarPosition.allCases {
+            for size in [NSSize(width: 360, height: 300), NSSize(width: 480, height: 680), NSSize(width: 960, height: 650)] {
+                panel.setContentSize(size); setToolbarPosition(position); layoutChrome()
+                panel.contentView!.layoutSubtreeIfNeeded()
+                precondition(web.superview === content && web.frame == content.bounds)
+                precondition(content.subviews.map(ObjectIdentifier.init) == mounted)
+                precondition(!web.convert(web.bounds, to: panel.contentView).intersects(rail.frame))
+            }
+        }
         panel.setContentSize(NSSize(width: 480, height: 680)); setToolbarPosition(.left)
         showAdd()
         let emptyHeight = addOverlay!.frame.height
@@ -1088,7 +1114,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
         let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000 / 20
         print("Overlay create/close CPU-side wall time: \(String(format: "%.1f", elapsed)) ms/cycle (20 cycles, excludes display frame timing)")
-        print("PASS: full-page overlay, matched corners, add/settings draft retention, stable toolbar/web views, four positions and overflow")
+        print("PASS: separate 32pt sidebar, full web viewport, add/settings draft retention, stable toolbar/web views, four positions and overflow")
         return true
     }
 

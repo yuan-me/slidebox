@@ -1,5 +1,29 @@
 import AppKit
 
+final class SidebarSurface: NSVisualEffectView {
+    private let tint = SurfaceView(color: .windowBackgroundColor)
+    private var observer: NSObjectProtocol?
+
+    init() {
+        super.init(frame: .zero)
+        material = .sidebar; blendingMode = .behindWindow; state = .active
+        tint.autoresizingMask = [.width, .height]
+        tint.frame = bounds; addSubview(tint)
+        updateTint()
+        observer = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.updateTint() } }
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    deinit { if let observer { NSWorkspace.shared.notificationCenter.removeObserver(observer) } }
+
+    private func updateTint() {
+        // Keep ambient color subtle without fading the icons placed above the tint.
+        tint.alphaValue = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency ? 1 : 0.65
+    }
+}
+
 /// Uses system glass; older systems and Reduce Transparency keep usable contrast.
 final class GlassSurface: NSView {
     let body = NSView()

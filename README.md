@@ -6,7 +6,7 @@
 
 - 鼠标移到屏幕边缘即可展开，支持拖动排序、调整窗口大小和固定窗口。
 - 网页隐藏后默认 30 秒休眠，释放内存；再次展开时重新加载。可关闭休眠或自定义时间。
-- 网页内玻璃浮岛支持四向位置，添加与设置使用紧凑浮层。
+- 32pt 磨砂窄边栏支持四向位置，与网页独立排版；添加与设置使用紧凑浮层。
 - 自动检查 GitHub 正式版并下载、校验，手动替换安装。
 - 不预加载网页，不轮询鼠标，无第三方代码依赖。
 
@@ -22,7 +22,7 @@ A free, open-source macOS sidebar browser built with Swift and system WebKit for
 
 - Hover at the screen edge to open. Drag to reorder websites, resize the window, or pin it in place.
 - Hidden pages sleep after 30 seconds to free memory and reload when reopened. Turn sleep off or set your own delay.
-- A floating glass toolbar with four positions and compact settings/add-site overlays.
+- A 32pt frosted toolbar in four positions, laid out beside the webpage, with compact settings/add-site overlays.
 - Automatically check GitHub releases and download verified updates for manual installation.
 - No webpage preloading, mouse polling, or third-party code dependencies.
 
