@@ -18,7 +18,7 @@ final class AppUpdates {
 
     init(defaults: UserDefaults = .standard,
          directory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Slidebox/Updates", isDirectory: true),
-         version: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0") {
+         version: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.1") {
         self.defaults = defaults; self.directory = directory; self.version = version
         message = "当前版本 \(version)"
     }
